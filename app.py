@@ -13,24 +13,19 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ─── Line API Config ────────────────────────────────────────────────────────
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "YOUR_CHANNEL_SECRET")
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+LINE_CHANNEL_SECRET      = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_REPLY_URL           = "https://api.line.me/v2/bot/message/reply"
 
 HELP_TEXT = (
     "🤖 Bond Info Bot\n\n"
-    "พิมพ์ชื่อบริษัท หรือชื่อย่อ เพื่อดูข้อมูลหุ้นกู้\n\n"
+    "พิมพ์ชื่อย่อบริษัท เพื่อดูข้อมูลหุ้นกู้\n\n"
     "ตัวอย่าง:\n"
-    "  • PTT\n"
-    "  • CPALL\n"
-    "  • ปตท\n"
-    "  • กรุงเทพ\n\n"
-    "ข้อมูลจาก ThaiBMA (thaibma.or.th)"
+    "  PTT / CPALL / CI / ASW / TRUE\n\n"
+    "ข้อมูลจาก ThaiBMA"
 )
 
 
-# ─── Signature Validation ────────────────────────────────────────────────────
 def verify_signature(body: bytes, signature: str) -> bool:
     hash_value = hmac.new(
         LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256
@@ -39,71 +34,77 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-# ─── Line Reply Helper ───────────────────────────────────────────────────────
 def reply_text(reply_token: str, text: str):
-    # Line has 5000 char limit per message; split if needed
+    """ส่ง text reply กลับไปยัง LINE พร้อม logging ละเอียด"""
+    if not text:
+        logger.error("[reply] text is empty, skipping")
+        return
+
+    # LINE จำกัด 5 messages ต่อ reply, แต่ละ message ไม่เกิน 5000 chars
     messages = []
-    while text:
-        chunk = text[:4990]
-        text = text[4990:]
+    remaining = text
+    while remaining and len(messages) < 5:
+        chunk = remaining[:4990]
+        remaining = remaining[4990:]
         messages.append({"type": "text", "text": chunk})
-        if len(messages) >= 5:  # max 5 messages per reply
-            break
 
     payload = {"replyToken": reply_token, "messages": messages}
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
-    resp = requests.post(LINE_REPLY_URL, headers=headers, json=payload, timeout=10)
-    if resp.status_code != 200:
-        logger.error(f"Line reply failed: {resp.status_code} {resp.text}")
+
+    logger.info(f"[reply] Sending {len(messages)} message(s), total chars: {len(text)}")
+    logger.info(f"[reply] First 200 chars: {text[:200]}")
+
+    try:
+        resp = requests.post(LINE_REPLY_URL, headers=headers, json=payload, timeout=15)
+        logger.info(f"[reply] LINE API status: {resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"[reply] LINE API error: {resp.status_code} | {resp.text}")
+        else:
+            logger.info(f"[reply] LINE API success: {resp.text[:100]}")
+    except Exception as e:
+        logger.exception(f"[reply] Exception sending to LINE: {e}")
 
 
-def reply_loading(reply_token: str):
-    """Send a 'searching...' message first."""
-    reply_text(reply_token, "⏳ กำลังค้นหาข้อมูลหุ้นกู้ กรุณารอสักครู่...")
-
-
-# ─── Event Handlers ──────────────────────────────────────────────────────────
 def handle_message(event: dict):
     reply_token = event.get("replyToken", "")
     msg = event.get("message", {})
 
     if msg.get("type") != "text":
-        reply_text(reply_token, "กรุณาพิมพ์ชื่อบริษัทที่ต้องการค้นหาหุ้นกู้ครับ 🙏")
+        reply_text(reply_token, "กรุณาพิมพ์ชื่อย่อบริษัทที่ต้องการครับ 🙏")
         return
 
     user_text = msg.get("text", "").strip()
+    logger.info(f"[msg] User input: '{user_text}'")
 
-    # Commands
     if user_text.lower() in ["help", "ช่วยเหลือ", "วิธีใช้", "?"]:
         reply_text(reply_token, HELP_TEXT)
         return
 
-    logger.info(f"Searching bonds for: {user_text}")
+    # แจ้งว่ากำลังค้นหา (ส่งก่อนเลย เพราะอาจใช้เวลา)
+    # ไม่สามารถส่ง 2 replies ด้วย same token ได้ จึงทำในครั้งเดียว
 
     try:
         bonds = search_bonds_by_company(user_text)
+        logger.info(f"[msg] Got {len(bonds)} bonds for '{user_text}'")
         response_msg = format_bond_message(bonds, user_text)
+        logger.info(f"[msg] Formatted message length: {len(response_msg)}")
     except Exception as e:
-        logger.exception(f"Error searching bonds: {e}")
-        response_msg = (
-            f"❌ เกิดข้อผิดพลาดในการค้นหา\n"
-            f"กรุณาลองใหม่อีกครั้ง หรือพิมพ์ 'help' เพื่อดูวิธีใช้"
-        )
+        logger.exception(f"[msg] Error: {e}")
+        response_msg = "❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งครับ"
 
     reply_text(reply_token, response_msg)
 
 
-# ─── Webhook Endpoint ────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data()
 
     if not verify_signature(body, signature):
-        logger.warning("Invalid signature")
+        logger.warning("[webhook] Invalid signature")
         abort(400)
 
     try:
@@ -112,10 +113,9 @@ def webhook():
         abort(400)
 
     for event in payload.get("events", []):
-        event_type = event.get("type")
-        if event_type == "message":
+        if event.get("type") == "message":
             handle_message(event)
-        elif event_type == "follow":
+        elif event.get("type") == "follow":
             reply_text(event.get("replyToken", ""), HELP_TEXT)
 
     return "OK", 200
