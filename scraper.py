@@ -78,74 +78,60 @@ def fetch_bond_list(abbr_name: str, session: requests.Session) -> list[dict]:
 
 
 def _item_to_bond(item: dict, term_type: str) -> dict | None:
-    """แปลง JSON item เป็น bond dict"""
+    """แปลง JSON item เป็น bond dict — ใช้ key จริงจาก ThaiBMA API"""
     if not isinstance(item, dict):
         return None
 
-    # log ครั้งแรกเพื่อ debug structure
-    logger.info(f"[item] keys: {list(item.keys())}")
-
-    # หา symbol จาก key ที่เป็นไปได้
-    symbol = ""
-    for k in ["symbol", "Symbol", "ThaiBMASymbol", "thaiBMASymbol", "bondSymbol",
-              "BondSymbol", "abbr", "Abbr", "name", "Name", "bondName"]:
-        if k in item and item[k]:
-            symbol = str(item[k]).strip()
-            break
-    if not symbol:
-        return None
-
     def g(*keys):
-        """Get first matching key value"""
         for k in keys:
             if k in item and item[k] is not None:
                 v = str(item[k]).strip()
-                if v and v not in ["", "null", "None"]:
+                if v and v not in ["", "null", "None", "0"]:
                     return v
         return "-"
+
+    symbol = g("Symbol", "symbol", "ThaiBMASymbol")
+    if symbol == "-":
+        return None
+
+    # SecureCode: FASSET = มีหลักประกัน, UNSECURE = ไม่มี
+    secure_code = g("SecureCode", "securedType", "SecuredType")
+    sc_lower = secure_code.lower()
+    if "unsecure" in sc_lower:
+        secured_label = "🔓 ไม่มีหลักประกัน (Unsecured)"
+    elif secure_code != "-":
+        secured_label = f"🔒 มีหลักประกัน ({secure_code})"
+    else:
+        secured_label = "🔓 ไม่มีหลักประกัน"
 
     bond = {
         "symbol":           symbol,
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
-        "issue_date":       g("issueDate", "IssueDate", "issue_date", "IssuedDate"),
-        "maturity_date":    g("maturityDate", "MaturityDate", "maturity_date", "DueDate"),
-        "tenor":            g("term", "Term", "tenor", "Tenor", "issueTermYr", "IssueTerm"),
-        "coupon_rate":      g("couponRate", "CouponRate", "coupon", "Coupon", "interestRate", "InterestRate"),
-        "issue_size":       g("issueSize", "IssueSize", "faceValue", "FaceValue"),
-        "outstanding_size": g("outstanding", "Outstanding", "outstandingSize", "OutstandingSize"),
-        "secured_type":     g("securedType", "SecuredType", "secured", "Secured", "collateralType"),
-        "registrar":        g("registrar", "Registrar", "registrarName"),
-        "bondholder_rep":   g("bondholderRep", "BondholderRep", "debenHolder", "DebenHolder",
-                               "bondholderRepresentative", "BondholderRepresentative"),
-        "underwriters":     g("underwriter", "Underwriter", "underwriters", "Underwriters",
-                               "leadManager", "LeadManager"),
-        "financial_advisor": g("financialAdvisor", "FinancialAdvisor", "fa", "FA"),
-        "issue_rating":     g("issueRating", "IssueRating", "bondRating"),
-        "issuer_rating":    g("issuerRating", "IssuerRating"),
-        "distribution":     g("distribution", "Distribution", "distributionType"),
-        "isin":             g("isinCode", "IsinCode", "isin", "ISIN"),
+        "issue_date":       g("IssuedDate", "IssueDate", "issueDate"),
+        "maturity_date":    g("MaturityDate", "maturityDate"),
+        "tenor":            g("Term", "term", "tenor"),
+        "coupon_rate":      g("MarketYield", "CouponRate", "couponRate", "Coupon"),
+        "issue_size":       g("IssueSize", "issueSize"),
+        "outstanding_size": g("CurrentOutstanding", "IssueOutstanding", "outstanding"),
+        "secured_type":     secure_code,
+        "secured_label":    secured_label,
+        "registrar":        g("Registrar", "registrar"),
+        "bondholder_rep":   g("BondholderRepresentative", "bondholderRep"),
+        "underwriters":     g("Underwriter", "underwriter"),
+        "issue_rating":     g("IssueRating", "issueRating"),
+        "issuer_rating":    g("CompanyRating", "issuerRating"),
+        "distribution":     g("DistributionDisplay", "distribution"),
+        "attribute":        g("AttributeDisplay", "attribute"),
+        "esg":              g("ESGDisplay", "esg"),
+        "isin":             g("IssueLegacyID", "isinCode", "ISIN"),
     }
 
-    # หา detail URL
-    for k in ["detailUrl", "DetailUrl", "url", "Url", "bondUrl", "BondUrl", "guid", "Guid", "id", "Id"]:
-        if k in item and item[k]:
-            v = str(item[k]).strip()
-            if "-" in v and len(v) > 30:  # น่าจะเป็น UUID
-                bond["detail_url"] = f"{BOND_INFO_URL}?symbol={v}"
-            elif "http" in v.lower():
-                bond["detail_url"] = v
-            elif v:
-                bond["detail_url"] = f"{BOND_INFO_URL}?symbol={v}"
-            break
-
-    # สร้าง secured label
-    st = bond["secured_type"].lower()
-    if "unsecure" in st or st == "-":
-        bond["secured_label"] = "🔓 ไม่มีหลักประกัน (Unsecured)"
-    elif "secure" in st or "fasset" in st:
-        bond["secured_label"] = "🔒 มีหลักประกัน (Secured)"
-    else:
-        bond["secured_label"] = f"🔒 {bond['secured_type']}" if bond["secured_type"] != "-" else "🔓 ไม่มีหลักประกัน"
+    # หา detail URL จาก IssueID หรือ GUID
+    issue_id = g("IssueID", "issueId", "id", "Id")
+    if issue_id != "-" and "-" in issue_id:  # UUID pattern
+        bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
+    elif issue_id != "-":
+        bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
 
     return bond
 
@@ -259,10 +245,9 @@ def format_bond_message(bonds: list[dict], company_name: str) -> str:
             reg   = b.get("registrar", "-")
             bh    = b.get("bondholder_rep", "-")
             uw    = b.get("underwriters", "-")
-            fa    = b.get("financial_advisor", "-")
             dist  = b.get("distribution", "-")
 
-            lines += [
+            lines.extend([
                 f"\n🔹 {sym}",
                 f"  📅 ออก: {issue}",
                 f"  📅 ครบกำหนด: {mat}",
@@ -276,8 +261,7 @@ def format_bond_message(bonds: list[dict], company_name: str) -> str:
                 f"  🏦 Registrar: {reg}",
                 f"  👤 BH Rep: {bh}",
                 f"  📢 Underwriter: {uw}",
-                f"  💼 FA: {fa}",
-            ]
+            ])
 
     add_bonds(long_bonds, "📌 Long Term Debenture")
     add_bonds(short_bonds, "📌 Short Term Debenture")
