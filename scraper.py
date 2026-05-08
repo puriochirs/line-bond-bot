@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 import logging
 import re
+import json
 import time
 
 logger = logging.getLogger(__name__)
@@ -13,310 +14,223 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
-BASE_URL          = "https://www.thaibma.or.th"
-BOND_INFO_URL     = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
+BASE_URL           = "https://www.thaibma.or.th"
 ISSUER_DETAIL_BASE = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
+BOND_INFO_URL      = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 1: ดึงข้อมูลผ่านตาราง Issuer List บน Bond Info page
+# STRATEGY 1: ดึง JS จากหน้า Issuer Detail แล้วหา AJAX endpoint ของ Current Bond
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_bonds_via_issuer_link(company_name: str, session: requests.Session) -> list[dict]:
-    """
-    1. GET Bond Info page → เจอ issuer list table (abbr, name eng, name th)
-    2. หาแถวที่ abbreviation ตรงกับ company_name
-    3. ตาม link ไปยังหน้า bond list ของบริษัทนั้น
-    4. Parse bond data
-    """
-    prefix = company_name.strip().upper()
-
+def find_ajax_endpoint(issuer_code: str, session: requests.Session) -> list[dict]:
+    url = f"{ISSUER_DETAIL_BASE}?issuer={issuer_code}"
+    prefix = issuer_code.upper()
     try:
-        resp = session.get(BOND_INFO_URL, headers=HEADERS, timeout=20)
+        resp = session.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        page_html = resp.text
+        soup = BeautifulSoup(page_html, "lxml")
 
-        # log ทุก select element เพื่อ debug
-        selects = soup.find_all("select")
-        logger.info(f"[v6] selects found: {len(selects)}")
-        for s in selects[:3]:
-            opts = [o.get_text(strip=True) for o in s.find_all("option")[:5]]
-            logger.info(f"[v6] select name={s.get('name')} opts={opts}")
-
-        # หา link ที่เกี่ยวกับ issuer จาก issuer list table
-        issuer_link = None
-        for table in soup.find_all("table"):
-            headers_row = table.find("tr")
-            if not headers_row:
+        # 1) หา JSON data ที่ embed ใน script tags
+        for script in soup.find_all("script"):
+            src = script.get_text()
+            if not src:
                 continue
-            headers = [th.get_text(strip=True).lower() for th in headers_row.find_all(["th", "td"])]
+            # หา JSON array ที่มีข้อมูลหุ้นกู้ (symbol pattern เช่น PTT236A)
+            bond_sym_pattern = re.compile(rf'["\']({re.escape(prefix)}\d+[A-Z][^"\']*)["\']')
+            if bond_sym_pattern.search(src):
+                logger.info(f"[v7] Found bond symbols in script tag!")
+                bonds = _extract_from_js(src, prefix)
+                if bonds:
+                    return bonds
 
-            # ตาราง issuer list มี column "abbr" หรือ "symbol" หรือ "name"
-            if not any(k in " ".join(headers) for k in ["abbr", "symbol", "name"]):
-                continue
+        # 2) หา URL patterns ใน JavaScript
+        js_url_patterns = [
+            r'(?:url|src|href|dataSource|data-url)\s*[=:]\s*["\']([^"\']+)["\']',
+            r'\.(?:ajax|get|post|load)\s*\(\s*["\']([^"\']+)["\']',
+            r'fetch\s*\(\s*["\']([^"\']+)["\']',
+            r'\.(?:read|query)\s*\(\s*\{[^}]*url\s*:\s*["\']([^"\']+)["\']',
+            r'["\']url["\']:\s*["\']([^"\']+)["\']',
+        ]
+        candidate_urls = set()
+        all_js = " ".join(s.get_text() for s in soup.find_all("script"))
+        for pattern in js_url_patterns:
+            for m in re.finditer(pattern, all_js, re.I):
+                u = m.group(1)
+                if any(k in u.lower() for k in ["bond", "current", "issue", "issuer", "aspx", "ashx", "asmx", "api"]):
+                    if u.startswith("/") or u.startswith("http"):
+                        candidate_urls.add(u)
 
-            logger.info(f"[v6] scanning table headers: {headers}")
+        logger.info(f"[v7] Candidate AJAX URLs: {list(candidate_urls)[:10]}")
 
-            for row in table.find_all("tr")[1:]:
-                cells = row.find_all(["td", "th"])
-                if not cells:
-                    continue
-
-                row_text = " ".join(c.get_text(strip=True) for c in cells).upper()
-
-                # ตรวจว่าแถวนี้ตรงกับ company ที่ค้นหา
-                if prefix not in row_text:
-                    continue
-
-                # หา link ในแถวนี้
-                for a in row.find_all("a", href=True):
-                    href = a["href"]
-                    if any(k in href for k in ["Issuer", "Bond", "Issue", "Detail"]):
-                        issuer_link = _full_url(href)
-                        logger.info(f"[v6] found issuer link: {issuer_link}")
-                        break
-                if issuer_link:
-                    break
-            if issuer_link:
-                break
-
-        if not issuer_link:
-            logger.info(f"[v6] no issuer link found for '{prefix}'")
-            return []
-
-        # ตาม link ไปหน้า issuer/bond list
-        time.sleep(0.5)
-        resp2 = session.get(issuer_link, headers={**HEADERS, "Referer": BOND_INFO_URL}, timeout=20)
-        resp2.raise_for_status()
-        soup2 = BeautifulSoup(resp2.text, "lxml")
-
-        logger.info(f"[v6] issuer page url: {issuer_link}")
-        logger.info(f"[v6] issuer page tables: {len(soup2.find_all('table'))}, links: {len(soup2.find_all('a', href=True))}")
-
-        bonds = _parse_bond_links_and_table(soup2, prefix)
-        logger.info(f"[v6] found {len(bonds)} bonds from issuer page")
-        return bonds
+        # 3) ลอง GET/POST แต่ละ candidate URL
+        for u in list(candidate_urls)[:10]:
+            full_u = u if u.startswith("http") else BASE_URL + u
+            # เพิ่ม issuer parameter
+            sep = "&" if "?" in full_u else "?"
+            test_urls = [
+                full_u,
+                f"{full_u}{sep}issuer={issuer_code}",
+                f"{full_u}{sep}Issuer={issuer_code}",
+            ]
+            for tu in test_urls:
+                try:
+                    r = session.get(tu, headers={**HEADERS, "Referer": url, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
+                    if r.status_code == 200 and len(r.text) > 100:
+                        bonds = _try_parse_response(r.text, r.headers.get("Content-Type", ""), prefix)
+                        if bonds:
+                            logger.info(f"[v7] AJAX endpoint found: {tu}")
+                            return bonds
+                except Exception:
+                    pass
 
     except Exception as e:
-        logger.exception(f"[v6] issuer_link error: {e}")
-        return []
+        logger.exception(f"[v7] find_ajax_endpoint error: {e}")
+    return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 2: Issuer Detail page + UpdatePanel (trigger Current Bond tab)
+# STRATEGY 2: UpdatePanel ด้วย proper Delta parsing + ScriptManager
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_bonds_via_updatepanel(company_name: str, session: requests.Session) -> list[dict]:
-    """
-    ไปหน้า IssuerDetail แล้ว trigger Current Bond tab ด้วย ASP.NET UpdatePanel partial postback
-    """
-    issuer_code = company_name.strip().lower()
+def find_bonds_updatepanel(issuer_code: str, session: requests.Session) -> list[dict]:
     url = f"{ISSUER_DETAIL_BASE}?issuer={issuer_code}"
-
+    prefix = issuer_code.upper()
     try:
         resp = session.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
-
-        # ตรวจว่าเจอหน้า issuer จริงๆ
-        page_text = soup.get_text(strip=True)
-        logger.info(f"[v6] issuer detail page text len: {len(page_text)}")
-
-        # ดูว่ามี bond data ใน initial HTML เลยหรือเปล่า
-        direct_bonds = _parse_bond_links_and_table(soup, company_name.strip().upper())
-        if direct_bonds:
-            logger.info(f"[v6] found {len(direct_bonds)} bonds in initial HTML")
-            return direct_bonds
-
-        # ลอง trigger Current Bond tab ผ่าน UpdatePanel
         fields = _get_viewstate(soup)
 
-        # ค้นหา tab control IDs จาก HTML
-        tab_targets = []
-        for el in soup.find_all(attrs={"id": True}):
-            eid = el.get("id", "")
-            if any(k in eid.lower() for k in ["tab", "container"]):
-                # แปลง id เป็น __EVENTTARGET format (replace _ with $)
-                target = "ctl00$ContentPlaceHolder1$" + eid.replace("ctl00_ContentPlaceHolder1_", "").replace("_", "$")
-                tab_targets.append(target)
+        # หา ScriptManager
+        sm_id = None
+        for inp in soup.find_all("input", {"id": re.compile("ScriptManager", re.I)}):
+            sm_id = inp.get("name") or inp.get("id")
+        for el in soup.find_all(attrs={"id": re.compile("ScriptManager", re.I)}):
+            sm_id = el.get("id")
+            break
+        if not sm_id:
+            sm_id = "ctl00$ScriptManager1"
 
+        logger.info(f"[v7] ScriptManager id: {sm_id}")
+
+        # หา UpdatePanel IDs
+        up_ids = []
+        for el in soup.find_all(attrs={"id": re.compile(r"UpdatePanel|upd|panel", re.I)}):
+            eid = el.get("id", "")
+            if eid:
+                up_ids.append(eid.replace("_", "$"))
+
+        # หา Tab control IDs
+        tab_ids = []
+        for el in soup.find_all(attrs={"id": re.compile(r"tab|Tab", re.I)}):
+            eid = el.get("id", "")
+            if eid and ("tab" in eid.lower()):
+                tab_ids.append(eid)
+
+        logger.info(f"[v7] UpdatePanel IDs: {up_ids[:5]}, Tab IDs: {tab_ids[:10]}")
+
+        # ลอง trigger Current Bond tab (tab index 1)
+        targets_to_try = []
+        for tid in tab_ids:
+            t = tid.replace("_", "$")
+            targets_to_try.append(t)
         # เพิ่ม common patterns
-        tab_targets += [
+        targets_to_try += [
             "ctl00$ContentPlaceHolder1$TabContainer1",
+            "ctl00$ContentPlaceHolder1$tab",
             "ctl00$ContentPlaceHolder1$tcMain",
-            "ctl00$ContentPlaceHolder1$TabPanel2",
         ]
 
-        for target in tab_targets[:5]:
-            fields_copy = {**fields}
-            fields_copy["__EVENTTARGET"] = target
-            fields_copy["__EVENTARGUMENT"] = "1"  # tab index 1 = Current Bond
-            fields_copy["__ASYNCPOST"] = "true"
+        for target in targets_to_try[:8]:
+            for tab_idx in ["1", "0"]:  # 1 = Current Bond, 0 = Issuer Info
+                f = {**fields}
+                f["__EVENTTARGET"] = target
+                f["__EVENTARGUMENT"] = tab_idx
+                f["__ASYNCPOST"] = "true"
+                # ScriptManager field: SM_id=UpdatePanelID|EventTarget
+                for up_id in (up_ids[:1] or ["ctl00$ContentPlaceHolder1$UpdatePanel1"]):
+                    f[sm_id] = f"{up_id}|{target}"
+                    break
 
-            resp2 = session.post(
-                url, data=fields_copy,
-                headers={
-                    **HEADERS,
-                    "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                    "X-MicrosoftAjax": "Delta=true",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": url,
-                },
-                timeout=25,
-            )
+                r = session.post(
+                    url, data=f,
+                    headers={
+                        **HEADERS,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                        "X-MicrosoftAjax": "Delta=true",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": url,
+                    },
+                    timeout=25,
+                )
 
-            # UpdatePanel response format: "length|type|id|content|..."
-            raw = resp2.text
-            logger.info(f"[v6] UpdatePanel target={target} resp len={len(raw)}")
+                raw = r.text
+                # Parse Delta format properly
+                panels = _parse_delta(raw)
+                logger.info(f"[v7] Delta target={target}[{tab_idx}]: {len(panels)} panels")
 
-            # Extract HTML from Delta response
-            html_parts = re.findall(r"\d+\|updatePanel\|[^|]+\|(.*?)(?=\d+\|(?:updatePanel|hiddenField|asyncPostBackControlIDs)|$)", raw, re.DOTALL)
-            if not html_parts:
-                # ลอง parse ตรงๆ
-                html_parts = [raw]
+                for ptype, pid, content in panels:
+                    if ptype != "updatePanel":
+                        continue
+                    logger.info(f"[v7] Panel id={pid}, content len={len(content)}")
+                    part_soup = BeautifulSoup(content, "lxml")
+                    bonds = _parse_bond_table(part_soup, prefix)
+                    if bonds:
+                        logger.info(f"[v7] Found {len(bonds)} bonds in panel '{pid}'!")
+                        return bonds
 
-            for html_part in html_parts:
-                part_soup = BeautifulSoup(html_part, "lxml")
-                bonds = _parse_bond_links_and_table(part_soup, company_name.strip().upper())
-                if bonds:
-                    logger.info(f"[v6] UpdatePanel found {len(bonds)} bonds!")
-                    return bonds
+                    # ลองหา JSON ใน script
+                    for script in part_soup.find_all("script"):
+                        js = script.get_text()
+                        b = _extract_from_js(js, prefix)
+                        if b:
+                            return b
 
     except Exception as e:
-        logger.exception(f"[v6] updatepanel error: {e}")
-
+        logger.exception(f"[v7] updatepanel error: {e}")
     return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 3: GET Issuer Detail + parse ทุกอย่างที่มี
+# STRATEGY 3: ลองหา API endpoints ที่ทราบ patterns
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_bonds_direct(company_name: str, session: requests.Session) -> list[dict]:
-    """ลอง GET หน้า Issuer Detail หลายรูปแบบ แล้ว parse สิ่งที่มี"""
-    codes_to_try = [
-        company_name.strip().lower(),
-        company_name.strip().upper(),
-    ]
-    for code in codes_to_try:
-        url = f"{ISSUER_DETAIL_BASE}?issuer={code}"
+KNOWN_PATTERNS = [
+    "/EN/Issuer/GetCurrentBond.aspx?issuer={code}",
+    "/EN/Issuer/GetCurrentBond.ashx?issuer={code}",
+    "/EN/Issuer/CurrentBond.aspx?issuer={code}",
+    "/EN/BondInfo/BondFeature/Issue.aspx?issuer={code}",
+    "/EN/BondInfo/BondFeature/Issue.aspx?Issuer={code}",
+    "/EN/BondInfo/GetBond.aspx?issuer={code}",
+    "/EN/Issuer/IssuerBond.aspx?issuer={code}",
+    "/api/bond?issuer={code}",
+    "/EN/Issuer/GetBondsByIssuer?issuer={code}",
+]
+
+def try_known_endpoints(issuer_code: str, session: requests.Session) -> list[dict]:
+    prefix = issuer_code.upper()
+    ref = f"{ISSUER_DETAIL_BASE}?issuer={issuer_code}"
+    for pattern in KNOWN_PATTERNS:
+        url = BASE_URL + pattern.format(code=issuer_code)
         try:
-            resp = session.get(url, headers=HEADERS, timeout=20)
-            if resp.status_code != 200:
+            r = session.get(url, headers={**HEADERS, "Referer": ref, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
+            if r.status_code != 200 or len(r.text) < 50:
                 continue
-            soup = BeautifulSoup(resp.text, "lxml")
-            bonds = _parse_bond_links_and_table(soup, company_name.strip().upper())
+            ct = r.headers.get("Content-Type", "")
+            bonds = _try_parse_response(r.text, ct, prefix)
             if bonds:
-                logger.info(f"[v6] direct found {len(bonds)} bonds for code '{code}'")
+                logger.info(f"[v7] Known endpoint worked: {url}")
                 return bonds
+            logger.info(f"[v7] Tried {url}: status={r.status_code} len={len(r.text)}")
         except Exception as e:
-            logger.warning(f"[v6] direct error for code '{code}': {e}")
+            logger.warning(f"[v7] Known endpoint {url}: {e}")
     return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS: Parse bond links and table from any soup
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_bond_links_and_table(soup: BeautifulSoup, prefix: str) -> list[dict]:
-    """
-    Parse bond data จาก soup — รองรับทั้ง link-based และ table-based
-    Filter เฉพาะ bond ที่ symbol ขึ้นต้นด้วย prefix
-    """
-    bonds = []
-    seen_symbols = set()
-
-    # 1) หา bond detail links (Issue.aspx?symbol=uuid)
-    detail_map = {}
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        onclick = a.get("onclick", "")
-        sym = a.get_text(strip=True).split()[0].upper() if a.get_text(strip=True) else ""
-
-        url = None
-        if "Issue.aspx?symbol=" in href:
-            url = _full_url(href)
-        elif "Issue.aspx" in href and "symbol=" in href.lower():
-            url = _full_url(href)
-
-        # onclick UUID
-        if not url:
-            m = re.search(r"['\"]([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})['\"]", onclick)
-            if m:
-                url = f"{BOND_INFO_URL}?symbol={m.group(1)}"
-
-        if url and sym and sym.startswith(prefix):
-            detail_map[sym] = url
-
-    logger.info(f"[parse] detail_map size: {len(detail_map)}, prefix='{prefix}'")
-
-    # 2) Parse ตาราง
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            continue
-
-        header_cells = rows[0].find_all(["th", "td"])
-        headers = [c.get_text(strip=True).lower() for c in header_cells]
-        joined = " ".join(headers)
-
-        if not any(k in joined for k in ["symbol", "maturity", "issue", "term", "coupon", "ttm"]):
-            continue
-
-        logger.info(f"[parse] bond table headers: {headers}")
-        col = _map_cols(headers)
-
-        for row in rows[1:]:
-            cells = row.find_all(["td", "th"])
-            if not cells or all(c.get_text(strip=True) == "" for c in cells):
-                continue
-
-            cell_texts = [c.get_text(strip=True) for c in cells]
-
-            sym_idx = col.get("symbol", 0)
-            raw_sym = cell_texts[sym_idx] if sym_idx < len(cell_texts) else cell_texts[0]
-            sym = raw_sym.split()[0].upper() if raw_sym else ""
-
-            if not sym or not sym.startswith(prefix):
-                continue
-            if sym in seen_symbols:
-                continue
-            seen_symbols.add(sym)
-
-            bond = {"symbol": sym}
-            for field, idx in col.items():
-                if field != "symbol" and idx < len(cell_texts) and cell_texts[idx]:
-                    bond[field] = cell_texts[idx]
-
-            # ลอง get detail URL จาก link ใน row
-            detail_url = detail_map.get(sym, "")
-            if not detail_url:
-                row_links = row.find_all("a", href=True)
-                for a in row_links:
-                    href = a["href"]
-                    if "symbol=" in href.lower():
-                        detail_url = _full_url(href)
-                        break
-                    onclick = a.get("onclick", "")
-                    m = re.search(r"['\"]([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})['\"]", onclick)
-                    if m:
-                        detail_url = f"{BOND_INFO_URL}?symbol={m.group(1)}"
-                        break
-
-            bond["detail_url"] = detail_url
-            logger.info(f"[parse] ✓ bond: {sym}, url={'yes' if detail_url else 'no'}")
-            bonds.append(bond)
-
-    # 3) ถ้าหาจาก table ไม่ได้ แต่มี detail_map → ใช้จาก detail_map
-    if not bonds and detail_map:
-        for sym, url in detail_map.items():
-            bonds.append({"symbol": sym, "detail_url": url})
-
-    return bonds
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2: ดึง detail จากหน้า Bond Detail
+# STEP 2: ดึง bond detail
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
@@ -327,19 +241,18 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
         resp = session.get(detail_url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
-
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
-                pairs = [(cells[i].get_text(strip=True).lower(),
-                          cells[i+1].get_text(" ", strip=True))
-                         for i in range(0, len(cells)-1, 2)]
+                pairs = []
+                for i in range(0, len(cells)-1, 2):
+                    pairs.append((cells[i].get_text(strip=True).lower(),
+                                  cells[i+1].get_text(" ", strip=True)))
                 if len(cells) == 4:
-                    pairs += [(cells[2].get_text(strip=True).lower(),
-                               cells[3].get_text(" ", strip=True))]
+                    pairs.append((cells[2].get_text(strip=True).lower(),
+                                  cells[3].get_text(" ", strip=True)))
                 for label, value in pairs:
                     _assign(detail, label, value)
-
         st = detail.get("secured_type", "").lower()
         bt = detail.get("bond_type", "").lower()
         if "unsecure" in st or "unsecure" in bt:
@@ -348,11 +261,8 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
             detail["secured_label"] = "🔒 มีหลักประกัน"
         else:
             detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
-
-        logger.info(f"[detail] {detail.get('symbol')} coupon={detail.get('coupon_rate')} uw={str(detail.get('underwriters',''))[:40]}")
-
     except Exception as e:
-        logger.exception(f"[detail] error {detail_url}: {e}")
+        logger.exception(f"[detail] {detail_url}: {e}")
     return detail
 
 
@@ -363,25 +273,27 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
 def search_bonds_by_company(company_name: str) -> list[dict]:
     session = requests.Session()
     session.headers.update(HEADERS)
-    name = company_name.strip()
-    logger.info(f"[main] === Searching: '{name}' ===")
+    code = company_name.strip()
+    logger.info(f"[main] === Searching: '{code}' ===")
 
-    # Strategy 1: Follow issuer link from Bond Info page
-    bond_list = find_bonds_via_issuer_link(name, session)
+    bond_list = []
 
-    # Strategy 2: Issuer Detail page + UpdatePanel
+    # Strategy 1: find hidden AJAX endpoint
     if not bond_list:
-        bond_list = find_bonds_via_updatepanel(name, session)
+        bond_list = find_ajax_endpoint(code, session)
 
-    # Strategy 3: Direct GET Issuer Detail page
+    # Strategy 2: UpdatePanel with proper Delta parsing
     if not bond_list:
-        bond_list = find_bonds_direct(name, session)
+        bond_list = find_bonds_updatepanel(code, session)
+
+    # Strategy 3: try known endpoint patterns
+    if not bond_list:
+        bond_list = try_known_endpoints(code, session)
 
     if not bond_list:
-        logger.info(f"[main] No bonds found for '{name}'")
+        logger.info(f"[main] No bonds found for '{code}'")
         return []
 
-    # Fetch details
     results = []
     for b in bond_list[:10]:
         if b.get("detail_url"):
@@ -399,6 +311,143 @@ def search_bonds_by_company(company_name: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PARSE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_delta(raw: str) -> list[tuple]:
+    """Parse ASP.NET UpdatePanel Delta format: length|type|id|content|"""
+    parts = []
+    pos = 0
+    while pos < len(raw):
+        pipe1 = raw.find("|", pos)
+        if pipe1 == -1:
+            break
+        try:
+            length = int(raw[pos:pipe1])
+        except ValueError:
+            pos = pipe1 + 1
+            continue
+        pipe2 = raw.find("|", pipe1 + 1)
+        if pipe2 == -1:
+            break
+        ptype = raw[pipe1+1:pipe2]
+        pipe3 = raw.find("|", pipe2 + 1)
+        if pipe3 == -1:
+            break
+        pid = raw[pipe2+1:pipe3]
+        content_start = pipe3 + 1
+        content = raw[content_start:content_start + length]
+        parts.append((ptype, pid, content))
+        pos = content_start + length + 1
+    return parts
+
+
+def _parse_bond_table(soup: BeautifulSoup, prefix: str) -> list[dict]:
+    bonds = []
+    seen = set()
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        headers = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th", "td"])]
+        joined = " ".join(headers)
+        if not any(k in joined for k in ["symbol", "maturity", "issue", "term", "ttm", "coupon", "outstanding"]):
+            continue
+        logger.info(f"[parse_table] matching headers: {headers}")
+        col = _map_cols(headers)
+        for row in rows[1:]:
+            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if not cells or all(c == "" for c in cells):
+                continue
+            sym_idx = col.get("symbol", 0)
+            sym = cells[sym_idx].split()[0].upper() if sym_idx < len(cells) else ""
+            if not sym or not sym.startswith(prefix) or sym in seen:
+                continue
+            seen.add(sym)
+            bond = {"symbol": sym}
+            for f, i in col.items():
+                if f != "symbol" and i < len(cells):
+                    bond[f] = cells[i]
+            # หา detail URL
+            row_el = table.find_all("tr")[rows.index(row) + 1 if row in rows else 0]
+            for a in row.find_all("a", href=True):
+                href = a["href"]
+                if "symbol=" in href.lower():
+                    bond["detail_url"] = _full_url(href)
+                    break
+                onclick = a.get("onclick", "")
+                m = re.search(r"['\"]([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})['\"]", onclick)
+                if m:
+                    bond["detail_url"] = f"{BOND_INFO_URL}?symbol={m.group(1)}"
+                    break
+            logger.info(f"[parse_table] ✓ {sym}")
+            bonds.append(bond)
+    return bonds
+
+
+def _extract_from_js(js: str, prefix: str) -> list[dict]:
+    """พยายามดึงข้อมูลจาก JSON ที่ embed ใน JavaScript"""
+    bonds = []
+    json_arrays = re.findall(r'\[(\{["\']symbol["\'].*?\})\]', js, re.DOTALL | re.I)
+    for arr in json_arrays:
+        try:
+            data = json.loads(f"[{arr}]")
+            for item in data:
+                sym = str(item.get("symbol", "")).upper()
+                if sym.startswith(prefix):
+                    bonds.append({
+                        "symbol":        sym,
+                        "issue_date":    str(item.get("issueDate", item.get("issue_date", "-"))),
+                        "maturity_date": str(item.get("maturityDate", item.get("maturity_date", "-"))),
+                        "coupon_rate":   str(item.get("coupon", item.get("couponRate", "-"))),
+                        "tenor":         str(item.get("term", item.get("tenor", "-"))),
+                    })
+        except Exception:
+            pass
+    return bonds
+
+
+def _try_parse_response(text: str, content_type: str, prefix: str) -> list[dict]:
+    """ลอง parse response ในทุก format ที่เป็นไปได้"""
+    # JSON response
+    if "json" in content_type.lower() or text.strip().startswith(("[", "{")):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [_item_to_bond(item, prefix) for item in data if _item_to_bond(item, prefix)]
+            if isinstance(data, dict):
+                for key in ["data", "bonds", "items", "result", "records"]:
+                    if key in data and isinstance(data[key], list):
+                        return [_item_to_bond(i, prefix) for i in data[key] if _item_to_bond(i, prefix)]
+        except Exception:
+            pass
+    # HTML response
+    soup = BeautifulSoup(text, "lxml")
+    return _parse_bond_table(soup, prefix)
+
+
+def _item_to_bond(item: dict, prefix: str) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    sym = ""
+    for k in ["symbol", "Symbol", "ThaiBMASymbol", "bondSymbol"]:
+        if k in item:
+            sym = str(item[k]).upper()
+            break
+    if not sym or not sym.startswith(prefix):
+        return None
+    return {
+        "symbol":         sym,
+        "issue_date":     str(item.get("issueDate", item.get("IssueDate", "-"))),
+        "maturity_date":  str(item.get("maturityDate", item.get("MaturityDate", "-"))),
+        "coupon_rate":    str(item.get("coupon", item.get("Coupon", item.get("couponRate", "-")))),
+        "tenor":          str(item.get("term", item.get("Term", "-"))),
+        "secured_type":   str(item.get("securedType", item.get("SecuredType", "-"))),
+        "outstanding_size": str(item.get("outstanding", item.get("Outstanding", "-"))),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FORMAT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -410,46 +459,29 @@ def format_bond_message(bonds: list[dict], company_name: str) -> str:
             "  เช่น PTT, CPALL, CI, ASW, KBANK\n\n"
             "📌 ข้อมูลจาก ThaiBMA"
         )
-
     lines = [f"📋 หุ้นกู้ {company_name.upper()} ({len(bonds)} รุ่น)", "─" * 28]
-
     for b in bonds:
-        sym   = b.get("symbol", "-")
-        issue = b.get("issue_date", "-")
-        mat   = b.get("maturity_date", "-")
-        tenor = b.get("tenor", "-")
-        cpn   = b.get("coupon_rate", "-")
-        out   = b.get("outstanding_size") or b.get("issue_size", "-")
-        sec   = b.get("secured_label", "🔓 ไม่มีหลักประกัน")
-        irat  = b.get("issue_rating", "-")
-        erat  = b.get("issuer_rating", "-")
-        reg   = b.get("registrar", "-")
-        bh    = b.get("bondholder_rep", "-")
-        uw    = b.get("underwriters", "-")
-        fa    = b.get("financial_advisor", "-")
-
         lines += [
-            f"\n🔹 {sym}",
-            f"  📅 ออก: {issue}",
-            f"  📅 ครบกำหนด: {mat}",
-            f"  ⏳ อายุ: {tenor}",
-            f"  💰 ดอกเบี้ย: {cpn}",
-            f"  💵 Outstanding: {out}",
-            f"  {sec}",
-            f"  📊 Issue Rating: {irat}",
-            f"  📊 Issuer Rating: {erat}",
-            f"  🏦 Registrar: {reg}",
-            f"  👤 BH Rep: {bh}",
-            f"  📢 Underwriter: {uw}",
-            f"  💼 FA: {fa}",
+            f"\n🔹 {b.get('symbol','-')}",
+            f"  📅 ออก: {b.get('issue_date','-')}",
+            f"  📅 ครบกำหนด: {b.get('maturity_date','-')}",
+            f"  ⏳ อายุ: {b.get('tenor','-')}",
+            f"  💰 ดอกเบี้ย: {b.get('coupon_rate','-')}",
+            f"  💵 Outstanding: {b.get('outstanding_size',b.get('issue_size','-'))}",
+            f"  {b.get('secured_label','🔓 ไม่มีหลักประกัน')}",
+            f"  📊 Issue Rating: {b.get('issue_rating','-')}",
+            f"  📊 Issuer Rating: {b.get('issuer_rating','-')}",
+            f"  🏦 Registrar: {b.get('registrar','-')}",
+            f"  👤 BH Rep: {b.get('bondholder_rep','-')}",
+            f"  📢 Underwriter: {b.get('underwriters','-')}",
+            f"  💼 FA: {b.get('financial_advisor','-')}",
         ]
-
     lines += ["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"]
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
+# SHARED HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_viewstate(soup: BeautifulSoup) -> dict:
@@ -463,21 +495,25 @@ def _get_viewstate(soup: BeautifulSoup) -> dict:
 
 def _map_cols(headers: list[str]) -> dict:
     col = {}
-    kw = {
-        "symbol":         ["symbol", "series", "thaibma symbol"],
-        "issue_date":     ["issue date"],
-        "maturity_date":  ["maturity date", "maturity"],
-        "coupon_rate":    ["coupon", "rate"],
-        "tenor":          ["term", "tenor", "ttm"],
-        "secured_type":   ["secured type", "secured"],
-        "registrar":      ["registrar"],
-        "outstanding_size": ["outstanding"],
-        "issue_size":     ["issue size"],
-    }
-    for field, keywords in kw.items():
-        for i, h in enumerate(headers):
-            if any(k in h for k in keywords) and field not in col:
-                col[field] = i
+    for i, h in enumerate(headers):
+        if any(k in h for k in ["symbol", "thaibma symbol"]) and "symbol" not in col:
+            col["symbol"] = i
+        if "issue date" in h and "issue_date" not in col:
+            col["issue_date"] = i
+        if "maturity" in h and "maturity_date" not in col:
+            col["maturity_date"] = i
+        if "coupon" in h and "coupon_rate" not in col:
+            col["coupon_rate"] = i
+        if ("term" in h or "ttm" in h) and "tenor" not in col:
+            col["tenor"] = i
+        if "secured" in h and "secured_type" not in col:
+            col["secured_type"] = i
+        if "registrar" in h and "registrar" not in col:
+            col["registrar"] = i
+        if "outstanding" in h and "outstanding_size" not in col:
+            col["outstanding_size"] = i
+        if "issue size" in h and "issue_size" not in col:
+            col["issue_size"] = i
     return col
 
 
@@ -498,7 +534,7 @@ def _assign(d: dict, label: str, value: str):
         d["coupon_rate"] = (m.group(1) + "%") if m else v[:80]
     elif "bond type" in label:
         d["bond_type"] = v
-    elif "secured type" in label or (label == "collateral"):
+    elif "secured type" in label or label == "collateral":
         d["secured_type"] = v
     elif "registrar" in label and "co-" not in label and not d.get("registrar"):
         d["registrar"] = v
@@ -508,21 +544,15 @@ def _assign(d: dict, label: str, value: str):
         d["underwriters"] = v
     elif "financial advisor" in label:
         d["financial_advisor"] = v
-    elif "isin" in label and "local" in label:
-        d["isin"] = v
-    elif "issue size" in label and "outstanding" not in label:
-        d["issue_size"] = v
     elif "outstanding size" in label:
         d["outstanding_size"] = v
+    elif "issue size" in label and "outstanding" not in label:
+        d["issue_size"] = v
     elif "issue rating" in label:
         d["issue_rating"] = v
     elif "issuer rating" in label and "issue " not in label:
         d["issuer_rating"] = v
-    elif "distribution" in label:
-        d["distribution"] = v
 
 
 def _full_url(href: str) -> str:
-    if href.startswith("http"):
-        return href
-    return BASE_URL + "/" + href.lstrip("/")
+    return href if href.startswith("http") else BASE_URL + "/" + href.lstrip("/")
