@@ -2,235 +2,156 @@ import requests
 from bs4 import BeautifulSoup
 import logging
 import re
-import json
 import time
+import json
 
 logger = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept": "application/json, text/html, */*",
     "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
+    "Referer": "https://www.thaibma.or.th/EN/Issuer/IssuerDetail.aspx",
 }
 
-BASE_URL           = "https://www.thaibma.or.th"
-ISSUER_DETAIL_BASE = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
-BOND_INFO_URL      = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
+BASE_URL      = "https://www.thaibma.or.th"
+REGISSUE_URL  = f"{BASE_URL}/issuer/regissue"          # JSON API
+BOND_INFO_URL = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
+ISSUER_DETAIL = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 1: ดึง JS จากหน้า Issuer Detail แล้วหา AJAX endpoint ของ Current Bond
+# STEP 1: ดึง bond list จาก JSON API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_ajax_endpoint(issuer_code: str, session: requests.Session) -> list[dict]:
-    url = f"{ISSUER_DETAIL_BASE}?issuer={issuer_code}"
-    prefix = issuer_code.upper()
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        page_html = resp.text
-        soup = BeautifulSoup(page_html, "lxml")
+def fetch_bond_list(abbr_name: str, session: requests.Session) -> list[dict]:
+    """
+    เรียก API:
+      GET /issuer/regissue?abbrName={TICKER}&term=long   → Long Term Debenture
+      GET /issuer/regissue?abbrName={TICKER}&term=short  → Short Term Debenture
+    คืน list ของ bond dicts พร้อม symbol, dates, term, secured, etc.
+    """
+    all_bonds = []
+    ref = f"{ISSUER_DETAIL}?issuer={abbr_name.lower()}"
 
-        # 1) หา JSON data ที่ embed ใน script tags
-        for script in soup.find_all("script"):
-            src = script.get_text()
-            if not src:
-                continue
-            # หา JSON array ที่มีข้อมูลหุ้นกู้ (symbol pattern เช่น PTT236A)
-            bond_sym_pattern = re.compile(rf'["\']({re.escape(prefix)}\d+[A-Z][^"\']*)["\']')
-            if bond_sym_pattern.search(src):
-                logger.info(f"[v7] Found bond symbols in script tag!")
-                bonds = _extract_from_js(src, prefix)
-                if bonds:
-                    return bonds
-
-        # 2) หา URL patterns ใน JavaScript
-        js_url_patterns = [
-            r'(?:url|src|href|dataSource|data-url)\s*[=:]\s*["\']([^"\']+)["\']',
-            r'\.(?:ajax|get|post|load)\s*\(\s*["\']([^"\']+)["\']',
-            r'fetch\s*\(\s*["\']([^"\']+)["\']',
-            r'\.(?:read|query)\s*\(\s*\{[^}]*url\s*:\s*["\']([^"\']+)["\']',
-            r'["\']url["\']:\s*["\']([^"\']+)["\']',
-        ]
-        candidate_urls = set()
-        all_js = " ".join(s.get_text() for s in soup.find_all("script"))
-        for pattern in js_url_patterns:
-            for m in re.finditer(pattern, all_js, re.I):
-                u = m.group(1)
-                if any(k in u.lower() for k in ["bond", "current", "issue", "issuer", "aspx", "ashx", "asmx", "api"]):
-                    if u.startswith("/") or u.startswith("http"):
-                        candidate_urls.add(u)
-
-        logger.info(f"[v7] Candidate AJAX URLs: {list(candidate_urls)[:10]}")
-
-        # 3) ลอง GET/POST แต่ละ candidate URL
-        for u in list(candidate_urls)[:10]:
-            full_u = u if u.startswith("http") else BASE_URL + u
-            # เพิ่ม issuer parameter
-            sep = "&" if "?" in full_u else "?"
-            test_urls = [
-                full_u,
-                f"{full_u}{sep}issuer={issuer_code}",
-                f"{full_u}{sep}Issuer={issuer_code}",
-            ]
-            for tu in test_urls:
-                try:
-                    r = session.get(tu, headers={**HEADERS, "Referer": url, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
-                    if r.status_code == 200 and len(r.text) > 100:
-                        bonds = _try_parse_response(r.text, r.headers.get("Content-Type", ""), prefix)
-                        if bonds:
-                            logger.info(f"[v7] AJAX endpoint found: {tu}")
-                            return bonds
-                except Exception:
-                    pass
-
-    except Exception as e:
-        logger.exception(f"[v7] find_ajax_endpoint error: {e}")
-    return []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 2: UpdatePanel ด้วย proper Delta parsing + ScriptManager
-# ─────────────────────────────────────────────────────────────────────────────
-
-def find_bonds_updatepanel(issuer_code: str, session: requests.Session) -> list[dict]:
-    url = f"{ISSUER_DETAIL_BASE}?issuer={issuer_code}"
-    prefix = issuer_code.upper()
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-        fields = _get_viewstate(soup)
-
-        # หา ScriptManager
-        sm_id = None
-        for inp in soup.find_all("input", {"id": re.compile("ScriptManager", re.I)}):
-            sm_id = inp.get("name") or inp.get("id")
-        for el in soup.find_all(attrs={"id": re.compile("ScriptManager", re.I)}):
-            sm_id = el.get("id")
-            break
-        if not sm_id:
-            sm_id = "ctl00$ScriptManager1"
-
-        logger.info(f"[v7] ScriptManager id: {sm_id}")
-
-        # หา UpdatePanel IDs
-        up_ids = []
-        for el in soup.find_all(attrs={"id": re.compile(r"UpdatePanel|upd|panel", re.I)}):
-            eid = el.get("id", "")
-            if eid:
-                up_ids.append(eid.replace("_", "$"))
-
-        # หา Tab control IDs
-        tab_ids = []
-        for el in soup.find_all(attrs={"id": re.compile(r"tab|Tab", re.I)}):
-            eid = el.get("id", "")
-            if eid and ("tab" in eid.lower()):
-                tab_ids.append(eid)
-
-        logger.info(f"[v7] UpdatePanel IDs: {up_ids[:5]}, Tab IDs: {tab_ids[:10]}")
-
-        # ลอง trigger Current Bond tab (tab index 1)
-        targets_to_try = []
-        for tid in tab_ids:
-            t = tid.replace("_", "$")
-            targets_to_try.append(t)
-        # เพิ่ม common patterns
-        targets_to_try += [
-            "ctl00$ContentPlaceHolder1$TabContainer1",
-            "ctl00$ContentPlaceHolder1$tab",
-            "ctl00$ContentPlaceHolder1$tcMain",
-        ]
-
-        for target in targets_to_try[:8]:
-            for tab_idx in ["1", "0"]:  # 1 = Current Bond, 0 = Issuer Info
-                f = {**fields}
-                f["__EVENTTARGET"] = target
-                f["__EVENTARGUMENT"] = tab_idx
-                f["__ASYNCPOST"] = "true"
-                # ScriptManager field: SM_id=UpdatePanelID|EventTarget
-                for up_id in (up_ids[:1] or ["ctl00$ContentPlaceHolder1$UpdatePanel1"]):
-                    f[sm_id] = f"{up_id}|{target}"
-                    break
-
-                r = session.post(
-                    url, data=f,
-                    headers={
-                        **HEADERS,
-                        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                        "X-MicrosoftAjax": "Delta=true",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": url,
-                    },
-                    timeout=25,
-                )
-
-                raw = r.text
-                # Parse Delta format properly
-                panels = _parse_delta(raw)
-                logger.info(f"[v7] Delta target={target}[{tab_idx}]: {len(panels)} panels")
-
-                for ptype, pid, content in panels:
-                    if ptype != "updatePanel":
-                        continue
-                    logger.info(f"[v7] Panel id={pid}, content len={len(content)}")
-                    part_soup = BeautifulSoup(content, "lxml")
-                    bonds = _parse_bond_table(part_soup, prefix)
-                    if bonds:
-                        logger.info(f"[v7] Found {len(bonds)} bonds in panel '{pid}'!")
-                        return bonds
-
-                    # ลองหา JSON ใน script
-                    for script in part_soup.find_all("script"):
-                        js = script.get_text()
-                        b = _extract_from_js(js, prefix)
-                        if b:
-                            return b
-
-    except Exception as e:
-        logger.exception(f"[v7] updatepanel error: {e}")
-    return []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 3: ลองหา API endpoints ที่ทราบ patterns
-# ─────────────────────────────────────────────────────────────────────────────
-
-KNOWN_PATTERNS = [
-    "/EN/Issuer/GetCurrentBond.aspx?issuer={code}",
-    "/EN/Issuer/GetCurrentBond.ashx?issuer={code}",
-    "/EN/Issuer/CurrentBond.aspx?issuer={code}",
-    "/EN/BondInfo/BondFeature/Issue.aspx?issuer={code}",
-    "/EN/BondInfo/BondFeature/Issue.aspx?Issuer={code}",
-    "/EN/BondInfo/GetBond.aspx?issuer={code}",
-    "/EN/Issuer/IssuerBond.aspx?issuer={code}",
-    "/api/bond?issuer={code}",
-    "/EN/Issuer/GetBondsByIssuer?issuer={code}",
-]
-
-def try_known_endpoints(issuer_code: str, session: requests.Session) -> list[dict]:
-    prefix = issuer_code.upper()
-    ref = f"{ISSUER_DETAIL_BASE}?issuer={issuer_code}"
-    for pattern in KNOWN_PATTERNS:
-        url = BASE_URL + pattern.format(code=issuer_code)
+    for term in ["long", "short"]:
+        url = f"{REGISSUE_URL}?abbrName={abbr_name}&term={term}"
         try:
-            r = session.get(url, headers={**HEADERS, "Referer": ref, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
-            if r.status_code != 200 or len(r.text) < 50:
-                continue
-            ct = r.headers.get("Content-Type", "")
-            bonds = _try_parse_response(r.text, ct, prefix)
-            if bonds:
-                logger.info(f"[v7] Known endpoint worked: {url}")
-                return bonds
-            logger.info(f"[v7] Tried {url}: status={r.status_code} len={len(r.text)}")
+            resp = session.get(
+                url,
+                headers={**HEADERS, "Referer": ref},
+                timeout=20,
+            )
+            resp.raise_for_status()
+
+            logger.info(f"[api] {term}: status={resp.status_code}, len={len(resp.text)}, ct={resp.headers.get('Content-Type','')}")
+
+            # Parse JSON
+            data = resp.json()
+            logger.info(f"[api] {term}: got {len(data) if isinstance(data, list) else type(data)} items")
+
+            if isinstance(data, list):
+                for item in data:
+                    bond = _item_to_bond(item, term)
+                    if bond:
+                        all_bonds.append(bond)
+            elif isinstance(data, dict):
+                # อาจอยู่ใน key เช่น "data", "result", "bonds"
+                for key in ["data", "result", "bonds", "items", "records", "value"]:
+                    if key in data and isinstance(data[key], list):
+                        for item in data[key]:
+                            bond = _item_to_bond(item, term)
+                            if bond:
+                                all_bonds.append(bond)
+                        break
+                # ถ้าไม่มี key ที่รู้จัก log raw data
+                if not all_bonds:
+                    logger.info(f"[api] {term}: dict keys = {list(data.keys())[:10]}")
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"[api] {term}: JSON decode error: {e}, raw={resp.text[:200]}")
         except Exception as e:
-            logger.warning(f"[v7] Known endpoint {url}: {e}")
-    return []
+            logger.exception(f"[api] {term}: error: {e}")
+
+    logger.info(f"[api] Total bonds from API: {len(all_bonds)}")
+    return all_bonds
+
+
+def _item_to_bond(item: dict, term_type: str) -> dict | None:
+    """แปลง JSON item เป็น bond dict"""
+    if not isinstance(item, dict):
+        return None
+
+    # log ครั้งแรกเพื่อ debug structure
+    logger.info(f"[item] keys: {list(item.keys())}")
+
+    # หา symbol จาก key ที่เป็นไปได้
+    symbol = ""
+    for k in ["symbol", "Symbol", "ThaiBMASymbol", "thaiBMASymbol", "bondSymbol",
+              "BondSymbol", "abbr", "Abbr", "name", "Name", "bondName"]:
+        if k in item and item[k]:
+            symbol = str(item[k]).strip()
+            break
+    if not symbol:
+        return None
+
+    def g(*keys):
+        """Get first matching key value"""
+        for k in keys:
+            if k in item and item[k] is not None:
+                v = str(item[k]).strip()
+                if v and v not in ["", "null", "None"]:
+                    return v
+        return "-"
+
+    bond = {
+        "symbol":           symbol,
+        "term_type":        "Long Term" if term_type == "long" else "Short Term",
+        "issue_date":       g("issueDate", "IssueDate", "issue_date", "IssuedDate"),
+        "maturity_date":    g("maturityDate", "MaturityDate", "maturity_date", "DueDate"),
+        "tenor":            g("term", "Term", "tenor", "Tenor", "issueTermYr", "IssueTerm"),
+        "coupon_rate":      g("couponRate", "CouponRate", "coupon", "Coupon", "interestRate", "InterestRate"),
+        "issue_size":       g("issueSize", "IssueSize", "faceValue", "FaceValue"),
+        "outstanding_size": g("outstanding", "Outstanding", "outstandingSize", "OutstandingSize"),
+        "secured_type":     g("securedType", "SecuredType", "secured", "Secured", "collateralType"),
+        "registrar":        g("registrar", "Registrar", "registrarName"),
+        "bondholder_rep":   g("bondholderRep", "BondholderRep", "debenHolder", "DebenHolder",
+                               "bondholderRepresentative", "BondholderRepresentative"),
+        "underwriters":     g("underwriter", "Underwriter", "underwriters", "Underwriters",
+                               "leadManager", "LeadManager"),
+        "financial_advisor": g("financialAdvisor", "FinancialAdvisor", "fa", "FA"),
+        "issue_rating":     g("issueRating", "IssueRating", "bondRating"),
+        "issuer_rating":    g("issuerRating", "IssuerRating"),
+        "distribution":     g("distribution", "Distribution", "distributionType"),
+        "isin":             g("isinCode", "IsinCode", "isin", "ISIN"),
+    }
+
+    # หา detail URL
+    for k in ["detailUrl", "DetailUrl", "url", "Url", "bondUrl", "BondUrl", "guid", "Guid", "id", "Id"]:
+        if k in item and item[k]:
+            v = str(item[k]).strip()
+            if "-" in v and len(v) > 30:  # น่าจะเป็น UUID
+                bond["detail_url"] = f"{BOND_INFO_URL}?symbol={v}"
+            elif "http" in v.lower():
+                bond["detail_url"] = v
+            elif v:
+                bond["detail_url"] = f"{BOND_INFO_URL}?symbol={v}"
+            break
+
+    # สร้าง secured label
+    st = bond["secured_type"].lower()
+    if "unsecure" in st or st == "-":
+        bond["secured_label"] = "🔓 ไม่มีหลักประกัน (Unsecured)"
+    elif "secure" in st or "fasset" in st:
+        bond["secured_label"] = "🔒 มีหลักประกัน (Secured)"
+    else:
+        bond["secured_label"] = f"🔒 {bond['secured_type']}" if bond["secured_type"] != "-" else "🔓 ไม่มีหลักประกัน"
+
+    return bond
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2: ดึง bond detail
+# STEP 2: ดึง detail จากหน้า Bond Detail (optional — ถ้า API ไม่มีข้อมูลครบ)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
@@ -238,7 +159,7 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
     if not detail_url:
         return detail
     try:
-        resp = session.get(detail_url, headers=HEADERS, timeout=20)
+        resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
         for table in soup.find_all("table"):
@@ -253,14 +174,14 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
                                   cells[3].get_text(" ", strip=True)))
                 for label, value in pairs:
                     _assign(detail, label, value)
+
         st = detail.get("secured_type", "").lower()
         bt = detail.get("bond_type", "").lower()
         if "unsecure" in st or "unsecure" in bt:
-            detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
+            detail["secured_label"] = "🔓 ไม่มีหลักประกัน (Unsecured)"
         elif "secure" in st or "fasset" in st or "secure" in bt:
-            detail["secured_label"] = "🔒 มีหลักประกัน"
-        else:
-            detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
+            detail["secured_label"] = "🔒 มีหลักประกัน (Secured)"
+
     except Exception as e:
         logger.exception(f"[detail] {detail_url}: {e}")
     return detail
@@ -272,179 +193,34 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
 
 def search_bonds_by_company(company_name: str) -> list[dict]:
     session = requests.Session()
-    session.headers.update(HEADERS)
-    code = company_name.strip()
-    logger.info(f"[main] === Searching: '{code}' ===")
+    abbr = company_name.strip().upper()
+    logger.info(f"[main] === Searching: '{abbr}' ===")
 
-    bond_list = []
+    # Step 1: ดึงจาก JSON API
+    bonds = fetch_bond_list(abbr, session)
 
-    # Strategy 1: find hidden AJAX endpoint
-    if not bond_list:
-        bond_list = find_ajax_endpoint(code, session)
-
-    # Strategy 2: UpdatePanel with proper Delta parsing
-    if not bond_list:
-        bond_list = find_bonds_updatepanel(code, session)
-
-    # Strategy 3: try known endpoint patterns
-    if not bond_list:
-        bond_list = try_known_endpoints(code, session)
-
-    if not bond_list:
-        logger.info(f"[main] No bonds found for '{code}'")
+    if not bonds:
+        logger.info(f"[main] API returned 0 bonds for '{abbr}'")
         return []
 
+    # Step 2: ถ้ามี detail_url และ API ให้ข้อมูลไม่ครบ ดึงเพิ่ม (optional)
     results = []
-    for b in bond_list[:10]:
-        if b.get("detail_url"):
+    for b in bonds[:15]:
+        detail_url = b.get("detail_url", "")
+        missing = b.get("coupon_rate", "-") == "-" or b.get("underwriters", "-") == "-"
+
+        if detail_url and missing:
             time.sleep(0.3)
-            detail = fetch_bond_detail(b["detail_url"], session)
-            merged = {**b, **detail}
-        else:
-            merged = b
-        if not merged.get("symbol"):
-            merged["symbol"] = b.get("symbol", "-")
-        results.append(merged)
+            detail = fetch_bond_detail(detail_url, session)
+            # เติมเฉพาะ field ที่ยังขาด
+            for k, v in detail.items():
+                if k not in b or b[k] == "-":
+                    b[k] = v
+
+        results.append(b)
 
     logger.info(f"[main] Done: {len(results)} bonds")
     return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PARSE HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_delta(raw: str) -> list[tuple]:
-    """Parse ASP.NET UpdatePanel Delta format: length|type|id|content|"""
-    parts = []
-    pos = 0
-    while pos < len(raw):
-        pipe1 = raw.find("|", pos)
-        if pipe1 == -1:
-            break
-        try:
-            length = int(raw[pos:pipe1])
-        except ValueError:
-            pos = pipe1 + 1
-            continue
-        pipe2 = raw.find("|", pipe1 + 1)
-        if pipe2 == -1:
-            break
-        ptype = raw[pipe1+1:pipe2]
-        pipe3 = raw.find("|", pipe2 + 1)
-        if pipe3 == -1:
-            break
-        pid = raw[pipe2+1:pipe3]
-        content_start = pipe3 + 1
-        content = raw[content_start:content_start + length]
-        parts.append((ptype, pid, content))
-        pos = content_start + length + 1
-    return parts
-
-
-def _parse_bond_table(soup: BeautifulSoup, prefix: str) -> list[dict]:
-    bonds = []
-    seen = set()
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if len(rows) < 2:
-            continue
-        headers = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th", "td"])]
-        joined = " ".join(headers)
-        if not any(k in joined for k in ["symbol", "maturity", "issue", "term", "ttm", "coupon", "outstanding"]):
-            continue
-        logger.info(f"[parse_table] matching headers: {headers}")
-        col = _map_cols(headers)
-        for row in rows[1:]:
-            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if not cells or all(c == "" for c in cells):
-                continue
-            sym_idx = col.get("symbol", 0)
-            sym = cells[sym_idx].split()[0].upper() if sym_idx < len(cells) else ""
-            if not sym or not sym.startswith(prefix) or sym in seen:
-                continue
-            seen.add(sym)
-            bond = {"symbol": sym}
-            for f, i in col.items():
-                if f != "symbol" and i < len(cells):
-                    bond[f] = cells[i]
-            # หา detail URL
-            row_el = table.find_all("tr")[rows.index(row) + 1 if row in rows else 0]
-            for a in row.find_all("a", href=True):
-                href = a["href"]
-                if "symbol=" in href.lower():
-                    bond["detail_url"] = _full_url(href)
-                    break
-                onclick = a.get("onclick", "")
-                m = re.search(r"['\"]([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})['\"]", onclick)
-                if m:
-                    bond["detail_url"] = f"{BOND_INFO_URL}?symbol={m.group(1)}"
-                    break
-            logger.info(f"[parse_table] ✓ {sym}")
-            bonds.append(bond)
-    return bonds
-
-
-def _extract_from_js(js: str, prefix: str) -> list[dict]:
-    """พยายามดึงข้อมูลจาก JSON ที่ embed ใน JavaScript"""
-    bonds = []
-    json_arrays = re.findall(r'\[(\{["\']symbol["\'].*?\})\]', js, re.DOTALL | re.I)
-    for arr in json_arrays:
-        try:
-            data = json.loads(f"[{arr}]")
-            for item in data:
-                sym = str(item.get("symbol", "")).upper()
-                if sym.startswith(prefix):
-                    bonds.append({
-                        "symbol":        sym,
-                        "issue_date":    str(item.get("issueDate", item.get("issue_date", "-"))),
-                        "maturity_date": str(item.get("maturityDate", item.get("maturity_date", "-"))),
-                        "coupon_rate":   str(item.get("coupon", item.get("couponRate", "-"))),
-                        "tenor":         str(item.get("term", item.get("tenor", "-"))),
-                    })
-        except Exception:
-            pass
-    return bonds
-
-
-def _try_parse_response(text: str, content_type: str, prefix: str) -> list[dict]:
-    """ลอง parse response ในทุก format ที่เป็นไปได้"""
-    # JSON response
-    if "json" in content_type.lower() or text.strip().startswith(("[", "{")):
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return [_item_to_bond(item, prefix) for item in data if _item_to_bond(item, prefix)]
-            if isinstance(data, dict):
-                for key in ["data", "bonds", "items", "result", "records"]:
-                    if key in data and isinstance(data[key], list):
-                        return [_item_to_bond(i, prefix) for i in data[key] if _item_to_bond(i, prefix)]
-        except Exception:
-            pass
-    # HTML response
-    soup = BeautifulSoup(text, "lxml")
-    return _parse_bond_table(soup, prefix)
-
-
-def _item_to_bond(item: dict, prefix: str) -> dict | None:
-    if not isinstance(item, dict):
-        return None
-    sym = ""
-    for k in ["symbol", "Symbol", "ThaiBMASymbol", "bondSymbol"]:
-        if k in item:
-            sym = str(item[k]).upper()
-            break
-    if not sym or not sym.startswith(prefix):
-        return None
-    return {
-        "symbol":         sym,
-        "issue_date":     str(item.get("issueDate", item.get("IssueDate", "-"))),
-        "maturity_date":  str(item.get("maturityDate", item.get("MaturityDate", "-"))),
-        "coupon_rate":    str(item.get("coupon", item.get("Coupon", item.get("couponRate", "-")))),
-        "tenor":          str(item.get("term", item.get("Term", "-"))),
-        "secured_type":   str(item.get("securedType", item.get("SecuredType", "-"))),
-        "outstanding_size": str(item.get("outstanding", item.get("Outstanding", "-"))),
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,67 +235,64 @@ def format_bond_message(bonds: list[dict], company_name: str) -> str:
             "  เช่น PTT, CPALL, CI, ASW, KBANK\n\n"
             "📌 ข้อมูลจาก ThaiBMA"
         )
+
+    # แยก short/long term
+    long_bonds  = [b for b in bonds if "Long" in b.get("term_type", "")]
+    short_bonds = [b for b in bonds if "Short" in b.get("term_type", "")]
+
     lines = [f"📋 หุ้นกู้ {company_name.upper()} ({len(bonds)} รุ่น)", "─" * 28]
-    for b in bonds:
-        lines += [
-            f"\n🔹 {b.get('symbol','-')}",
-            f"  📅 ออก: {b.get('issue_date','-')}",
-            f"  📅 ครบกำหนด: {b.get('maturity_date','-')}",
-            f"  ⏳ อายุ: {b.get('tenor','-')}",
-            f"  💰 ดอกเบี้ย: {b.get('coupon_rate','-')}",
-            f"  💵 Outstanding: {b.get('outstanding_size',b.get('issue_size','-'))}",
-            f"  {b.get('secured_label','🔓 ไม่มีหลักประกัน')}",
-            f"  📊 Issue Rating: {b.get('issue_rating','-')}",
-            f"  📊 Issuer Rating: {b.get('issuer_rating','-')}",
-            f"  🏦 Registrar: {b.get('registrar','-')}",
-            f"  👤 BH Rep: {b.get('bondholder_rep','-')}",
-            f"  📢 Underwriter: {b.get('underwriters','-')}",
-            f"  💼 FA: {b.get('financial_advisor','-')}",
-        ]
+
+    def add_bonds(bond_list: list[dict], label: str):
+        if not bond_list:
+            return
+        lines.append(f"\n{label} ({len(bond_list)} รุ่น)")
+        for b in bond_list:
+            sym   = b.get("symbol", "-")
+            issue = b.get("issue_date", "-")
+            mat   = b.get("maturity_date", "-")
+            tenor = b.get("tenor", "-")
+            cpn   = b.get("coupon_rate", "-")
+            out   = b.get("outstanding_size", b.get("issue_size", "-"))
+            sec   = b.get("secured_label", "🔓 ไม่มีหลักประกัน")
+            irat  = b.get("issue_rating", "-")
+            erat  = b.get("issuer_rating", "-")
+            reg   = b.get("registrar", "-")
+            bh    = b.get("bondholder_rep", "-")
+            uw    = b.get("underwriters", "-")
+            fa    = b.get("financial_advisor", "-")
+            dist  = b.get("distribution", "-")
+
+            lines += [
+                f"\n🔹 {sym}",
+                f"  📅 ออก: {issue}",
+                f"  📅 ครบกำหนด: {mat}",
+                f"  ⏳ อายุ: {tenor}",
+                f"  💰 ดอกเบี้ย: {cpn}",
+                f"  💵 Outstanding: {out}",
+                f"  {sec}",
+                f"  📢 ขายให้: {dist}",
+                f"  📊 Issue Rating: {irat}",
+                f"  📊 Issuer Rating: {erat}",
+                f"  🏦 Registrar: {reg}",
+                f"  👤 BH Rep: {bh}",
+                f"  📢 Underwriter: {uw}",
+                f"  💼 FA: {fa}",
+            ]
+
+    add_bonds(long_bonds, "📌 Long Term Debenture")
+    add_bonds(short_bonds, "📌 Short Term Debenture")
+
     lines += ["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"]
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED HELPERS
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _get_viewstate(soup: BeautifulSoup) -> dict:
-    fields = {}
-    for name in ["__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"]:
-        el = soup.find("input", {"name": name})
-        if el:
-            fields[name] = el.get("value", "")
-    return fields
-
-
-def _map_cols(headers: list[str]) -> dict:
-    col = {}
-    for i, h in enumerate(headers):
-        if any(k in h for k in ["symbol", "thaibma symbol"]) and "symbol" not in col:
-            col["symbol"] = i
-        if "issue date" in h and "issue_date" not in col:
-            col["issue_date"] = i
-        if "maturity" in h and "maturity_date" not in col:
-            col["maturity_date"] = i
-        if "coupon" in h and "coupon_rate" not in col:
-            col["coupon_rate"] = i
-        if ("term" in h or "ttm" in h) and "tenor" not in col:
-            col["tenor"] = i
-        if "secured" in h and "secured_type" not in col:
-            col["secured_type"] = i
-        if "registrar" in h and "registrar" not in col:
-            col["registrar"] = i
-        if "outstanding" in h and "outstanding_size" not in col:
-            col["outstanding_size"] = i
-        if "issue size" in h and "issue_size" not in col:
-            col["issue_size"] = i
-    return col
-
 
 def _assign(d: dict, label: str, value: str):
     v = value.strip()
-    if not label or not v or v == "-":
+    if not label or not v or v in ["-", "null"]:
         return
     if "symbol" in label and not d.get("symbol"):
         d["symbol"] = v.split()[0]
@@ -552,7 +325,3 @@ def _assign(d: dict, label: str, value: str):
         d["issue_rating"] = v
     elif "issuer rating" in label and "issue " not in label:
         d["issuer_rating"] = v
-
-
-def _full_url(href: str) -> str:
-    return href if href.startswith("http") else BASE_URL + "/" + href.lstrip("/")
