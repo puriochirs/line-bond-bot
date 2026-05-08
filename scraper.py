@@ -1,236 +1,334 @@
 import requests
 from bs4 import BeautifulSoup
-import json
-import re
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "th,en;q=0.9",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.thaibma.or.th/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 BASE_URL = "https://www.thaibma.or.th"
+ISSUER_SEARCH_URL = f"{BASE_URL}/EN/Issuer/IssuerSearch.aspx"
+BOND_INFO_URL = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
 
-def search_bonds_by_company(company_name: str) -> list[dict]:
-    """
-    Search for bonds issued by a given company name from ThaiBMA.
-    Returns a list of bond records.
-    """
+
+def get_viewstate(session, url):
+    """Fetch a page and extract ASP.NET form fields."""
+    resp = session.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+    fields = {}
+    for name in ["__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR", "__VIEWSTATEENCRYPTED"]:
+        el = soup.find("input", {"name": name})
+        if el:
+            fields[name] = el.get("value", "")
+    return fields, soup
+
+
+def search_issuer(company_name: str) -> list[dict]:
+    """Search ThaiBMA Issuer Search page for the company."""
+    session = requests.Session()
     try:
-        # ThaiBMA bond search endpoint (corporate bonds)
-        search_url = f"{BASE_URL}/EN/Market/Primary/CorporateBond.aspx"
-        
-        session = requests.Session()
-        
-        # First, get the page to obtain ASP.NET viewstate
-        resp = session.get(search_url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        fields, soup = get_viewstate(session, ISSUER_SEARCH_URL)
 
-        viewstate = soup.find("input", {"name": "__VIEWSTATE"})
-        eventvalidation = soup.find("input", {"name": "__EVENTVALIDATION"})
-        viewstategenerator = soup.find("input", {"name": "__VIEWSTATEGENERATOR"})
-
-        payload = {
-            "__VIEWSTATE": viewstate["value"] if viewstate else "",
-            "__EVENTVALIDATION": eventvalidation["value"] if eventvalidation else "",
-            "__VIEWSTATEGENERATOR": viewstategenerator["value"] if viewstategenerator else "",
-            "__EVENTTARGET": "",
-            "__EVENTARGUMENT": "",
-            "ctl00$ContentPlaceHolder1$txtIssuerName": company_name,
-            "ctl00$ContentPlaceHolder1$btnSearch": "Search",
-        }
-
-        resp2 = session.post(search_url, headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"}, data=payload, timeout=20)
-        resp2.raise_for_status()
-
-        return parse_bond_results(resp2.text, company_name)
-
-    except Exception as e:
-        print(f"[scraper] Error: {e}")
-        # Fallback: try alternative endpoint
-        return search_via_bond_info(company_name)
-
-
-def search_via_bond_info(company_name: str) -> list[dict]:
-    """Alternative search using bond info page."""
-    try:
-        url = f"{BASE_URL}/EN/Market/Primary/CorporateBond.aspx"
-        session = requests.Session()
-        resp = session.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Try to find search form inputs
-        form = soup.find("form")
-        if not form:
-            return []
-
-        inputs = {}
-        for inp in form.find_all("input"):
+        # Find the search input name
+        search_input = None
+        for inp in soup.find_all("input", {"type": ["text", "search"]}):
             name = inp.get("name", "")
-            val = inp.get("value", "")
-            if name:
-                inputs[name] = val
-
-        # Find the company name input field
-        for key in inputs:
-            if "issuer" in key.lower() or "company" in key.lower() or "name" in key.lower():
-                inputs[key] = company_name
+            if any(k in name.lower() for k in ["issuer", "company", "name", "search", "txt"]):
+                search_input = name
                 break
 
-        # Find search button
-        for inp in form.find_all("input", {"type": "submit"}):
-            inputs[inp.get("name", "btnSearch")] = inp.get("value", "Search")
+        if not search_input:
+            # Try to find any text input
+            for inp in soup.find_all("input", {"type": "text"}):
+                search_input = inp.get("name", "")
+                if search_input:
+                    break
 
-        resp2 = session.post(url, data=inputs, headers=HEADERS, timeout=20)
-        return parse_bond_results(resp2.text, company_name)
+        logger.info(f"[issuer_search] input field: {search_input}")
+
+        # Find submit button
+        submit_btn = None
+        for inp in soup.find_all("input", {"type": "submit"}):
+            submit_btn = inp.get("name", "")
+            break
+        if not submit_btn:
+            for btn in soup.find_all("button", {"type": "submit"}):
+                submit_btn = btn.get("name", "")
+                break
+
+        payload = {**fields}
+        if search_input:
+            payload[search_input] = company_name
+        if submit_btn:
+            payload[submit_btn] = "Search"
+
+        resp2 = session.post(
+            ISSUER_SEARCH_URL,
+            data=payload,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded", "Referer": ISSUER_SEARCH_URL},
+            timeout=25,
+        )
+        resp2.raise_for_status()
+
+        return parse_issuer_results(resp2.text, company_name)
 
     except Exception as e:
-        print(f"[scraper fallback] Error: {e}")
+        logger.exception(f"[issuer_search] error: {e}")
         return []
 
 
-def parse_bond_results(html: str, company_name: str) -> list[dict]:
-    """Parse HTML table from ThaiBMA search results into bond records."""
-    soup = BeautifulSoup(html, "html.parser")
+def search_bonds_by_issuer_code(issuer_code: str, session: requests.Session) -> list[dict]:
+    """After finding issuer code, search for their bonds."""
+    try:
+        fields, soup = get_viewstate(session, BOND_INFO_URL)
+
+        # Look for issuer dropdown or input
+        payload = {**fields}
+
+        # Try to set issuer code
+        for select in soup.find_all("select"):
+            name = select.get("name", "")
+            if any(k in name.lower() for k in ["issuer", "company"]):
+                payload[name] = issuer_code
+                break
+
+        # Find search button
+        for inp in soup.find_all("input", {"type": "submit"}):
+            payload[inp.get("name", "")] = inp.get("value", "Search")
+            break
+
+        resp = session.post(
+            BOND_INFO_URL,
+            data=payload,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded", "Referer": BOND_INFO_URL},
+            timeout=25,
+        )
+        return parse_bond_table(resp.text)
+    except Exception as e:
+        logger.exception(f"[bond_by_issuer] error: {e}")
+        return []
+
+
+def parse_issuer_results(html: str, company_name: str) -> list[dict]:
+    """Parse issuer search results and find matching company links."""
+    soup = BeautifulSoup(html, "lxml")
+    results = []
+
+    # Look for table rows with company names
+    tables = soup.find_all("table")
+    for table in tables:
+        rows = table.find_all("tr")
+        for row in rows[1:]:  # skip header
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+            row_text = " ".join(c.get_text(strip=True) for c in cells)
+            if company_name.upper() in row_text.upper():
+                # Find link to company detail
+                link = row.find("a")
+                href = link["href"] if link and link.get("href") else ""
+                results.append({
+                    "name": cells[0].get_text(strip=True) if cells else "",
+                    "href": href,
+                    "row_text": row_text,
+                })
+
+    logger.info(f"[parse_issuer] found {len(results)} matches for '{company_name}'")
+    return results
+
+
+def parse_bond_table(html: str) -> list[dict]:
+    """Parse bond data from HTML table."""
+    soup = BeautifulSoup(html, "lxml")
     bonds = []
 
-    # Find all tables that could contain bond data
     tables = soup.find_all("table")
     for table in tables:
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
 
-        # Try to detect header row
         headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
-        if not any(keyword in " ".join(headers).lower() for keyword in ["symbol", "maturity", "coupon", "issuer", "isin", "rate", "หุ้นกู้"]):
+        header_text = " ".join(headers).lower()
+
+        # Check if this looks like a bond table
+        if not any(k in header_text for k in ["symbol", "maturity", "coupon", "rate", "issue", "isin", "series"]):
             continue
 
         col_map = map_columns(headers)
-
         for row in rows[1:]:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-            if not cells or len(cells) < 3:
+            if not cells or len(cells) < 3 or all(c == "" for c in cells):
                 continue
-
-            bond = extract_bond(cells, col_map, headers)
-            if bond:
-                bonds.append(bond)
-
-    # Filter by company name if possible
-    if company_name and bonds:
-        filtered = [b for b in bonds if company_name.upper() in (b.get("issuer", "") + b.get("symbol", "")).upper()]
-        if filtered:
-            return filtered
+            bond = {}
+            for field, idx in col_map.items():
+                if idx < len(cells):
+                    bond[field] = cells[idx]
+            # Fallback positional assignment
+            if not bond:
+                bond = {
+                    "symbol": cells[0] if len(cells) > 0 else "-",
+                    "issue_date": cells[1] if len(cells) > 1 else "-",
+                    "maturity_date": cells[2] if len(cells) > 2 else "-",
+                    "coupon_rate": cells[3] if len(cells) > 3 else "-",
+                    "tenor": cells[4] if len(cells) > 4 else "-",
+                    "secured": cells[5] if len(cells) > 5 else "-",
+                    "underwriter": cells[6] if len(cells) > 6 else "-",
+                }
+            bonds.append(bond)
 
     return bonds
 
 
 def map_columns(headers: list[str]) -> dict:
-    """Map column indices to bond field names."""
     col_map = {}
     for i, h in enumerate(headers):
         h_lower = h.lower()
-        if any(k in h_lower for k in ["symbol", "series", "รุ่น"]):
-            col_map["symbol"] = i
-        elif any(k in h_lower for k in ["issuer", "company", "บริษัท"]):
-            col_map["issuer"] = i
-        elif any(k in h_lower for k in ["issue date", "วันที่ออก"]):
-            col_map["issue_date"] = i
-        elif any(k in h_lower for k in ["maturity", "ครบกำหนด", "due date"]):
-            col_map["maturity_date"] = i
-        elif any(k in h_lower for k in ["coupon", "rate", "อัตรา", "ดอกเบี้ย"]):
-            col_map["coupon_rate"] = i
-        elif any(k in h_lower for k in ["tenor", "term", "อายุ"]):
-            col_map["tenor"] = i
-        elif any(k in h_lower for k in ["secured", "collateral", "ประกัน"]):
-            col_map["secured"] = i
-        elif any(k in h_lower for k in ["underwriter", "ผู้จัดจำหน่าย", "arranger"]):
-            col_map["underwriter"] = i
-        elif any(k in h_lower for k in ["isin"]):
+        if any(k in h_lower for k in ["symbol", "series", "bond"]):
+            col_map.setdefault("symbol", i)
+        if any(k in h_lower for k in ["isin"]):
             col_map["isin"] = i
+        if any(k in h_lower for k in ["issue date", "issue_date", "issued"]):
+            col_map["issue_date"] = i
+        if any(k in h_lower for k in ["maturity", "due", "redemption", "expire"]):
+            col_map["maturity_date"] = i
+        if any(k in h_lower for k in ["coupon", "rate", "interest"]):
+            col_map["coupon_rate"] = i
+        if any(k in h_lower for k in ["tenor", "term", "year"]):
+            col_map["tenor"] = i
+        if any(k in h_lower for k in ["secured", "collateral", "security"]):
+            col_map["secured"] = i
+        if any(k in h_lower for k in ["underwriter", "lead", "arranger"]):
+            col_map["underwriter"] = i
     return col_map
 
 
-def extract_bond(cells: list[str], col_map: dict, headers: list[str]) -> dict | None:
-    """Extract a bond dict from a table row."""
-    if all(c == "" for c in cells):
-        return None
-
-    bond = {}
-    for field, idx in col_map.items():
-        if idx < len(cells):
-            bond[field] = cells[idx]
-
-    # Fallback: assign by position if col_map is empty
-    if not bond and len(cells) >= 4:
-        bond = {
-            "symbol": cells[0] if len(cells) > 0 else "-",
-            "issuer": cells[1] if len(cells) > 1 else "-",
-            "issue_date": cells[2] if len(cells) > 2 else "-",
-            "maturity_date": cells[3] if len(cells) > 3 else "-",
-            "coupon_rate": cells[4] if len(cells) > 4 else "-",
-        }
-
-    return bond if bond else None
-
-
-def compute_tenor(issue_date_str: str, maturity_date_str: str) -> str:
-    """Compute tenor in years from issue and maturity dates."""
-    try:
-        for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y", "%B %d, %Y"]:
-            try:
-                issue = datetime.strptime(issue_date_str.strip(), fmt)
-                maturity = datetime.strptime(maturity_date_str.strip(), fmt)
-                years = (maturity - issue).days / 365.25
-                return f"{years:.1f} ปี"
-            except ValueError:
-                continue
-    except Exception:
-        pass
+def compute_tenor(issue_str: str, maturity_str: str) -> str:
+    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%m/%d/%Y"]:
+        try:
+            issue = datetime.strptime(issue_str.strip(), fmt)
+            maturity = datetime.strptime(maturity_str.strip(), fmt)
+            years = (maturity - issue).days / 365.25
+            return f"{years:.1f} ปี"
+        except ValueError:
+            continue
     return "-"
 
 
+def search_bonds_by_company(company_name: str) -> list[dict]:
+    """Main entry point: search bonds for a company name."""
+    session = requests.Session()
+
+    # Strategy 1: Search via Issuer Search page
+    logger.info(f"[search] Trying issuer search for: {company_name}")
+    issuer_results = search_issuer(company_name)
+
+    if issuer_results:
+        # Try to get bonds for first matching issuer
+        first = issuer_results[0]
+        href = first.get("href", "")
+        if href:
+            full_url = href if href.startswith("http") else BASE_URL + "/" + href.lstrip("/")
+            try:
+                resp = session.get(full_url, headers=HEADERS, timeout=20)
+                bonds = parse_bond_table(resp.text)
+                if bonds:
+                    logger.info(f"[search] Found {len(bonds)} bonds via issuer link")
+                    return bonds
+            except Exception as e:
+                logger.exception(f"[search] issuer link error: {e}")
+
+    # Strategy 2: Bond Information page with company name
+    logger.info(f"[search] Trying bond info page direct search")
+    try:
+        fields, soup = get_viewstate(session, BOND_INFO_URL)
+        payload = {**fields}
+
+        # Find any text input and set company name
+        for inp in soup.find_all("input", {"type": "text"}):
+            name = inp.get("name", "")
+            if name:
+                payload[name] = company_name
+                break
+
+        # Submit
+        for inp in soup.find_all("input", {"type": "submit"}):
+            payload[inp.get("name", "")] = inp.get("value", "Search")
+            break
+
+        resp = session.post(
+            BOND_INFO_URL,
+            data=payload,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=25,
+        )
+        bonds = parse_bond_table(resp.text)
+        if bonds:
+            logger.info(f"[search] Found {len(bonds)} bonds via bond info page")
+            return bonds
+
+    except Exception as e:
+        logger.exception(f"[search] bond info page error: {e}")
+
+    logger.info(f"[search] No bonds found for: {company_name}")
+    return []
+
+
 def format_bond_message(bonds: list[dict], company_name: str) -> str:
-    """Format bond list into a Line message string."""
     if not bonds:
         return (
             f"❌ ไม่พบข้อมูลหุ้นกู้ของ \"{company_name}\"\n\n"
-            "กรุณาตรวจสอบชื่อบริษัทและลองใหม่อีกครั้ง\n"
-            "หรือลองพิมพ์ชื่อย่อ เช่น PTT, CPALL, TRUE"
+            "💡 ลองพิมพ์ใหม่ด้วย:\n"
+            "  • ชื่อย่อภาษาอังกฤษ เช่น PTT, CPALL, TRUE\n"
+            "  • ชื่อเต็ม เช่น BANGKOK EXPRESSWAY\n"
+            "  • ชื่อภาษาไทย เช่น ปตท\n\n"
+            "📌 ข้อมูลจาก ThaiBMA (www.thaibma.or.th)"
         )
 
-    lines = [f"📋 หุ้นกู้ของ {company_name.upper()}", f"พบทั้งหมด {len(bonds)} รุ่น", "─" * 30]
+    lines = [
+        f"📋 หุ้นกู้ของ {company_name.upper()}",
+        f"พบทั้งหมด {len(bonds)} รุ่น",
+        "─" * 28,
+    ]
 
-    for i, b in enumerate(bonds, 1):
+    for i, b in enumerate(bonds[:10], 1):  # แสดงสูงสุด 10 รุ่น
         symbol = b.get("symbol") or b.get("isin") or f"รุ่นที่ {i}"
         issue_date = b.get("issue_date", "-")
         maturity = b.get("maturity_date", "-")
         coupon = b.get("coupon_rate", "-")
         tenor = b.get("tenor") or compute_tenor(issue_date, maturity)
-        secured = b.get("secured", "-")
+        secured = b.get("secured", "")
         underwriter = b.get("underwriter", "-")
 
-        # Secured label
-        if secured and secured != "-":
-            secured_label = "🔒 มีหลักประกัน" if any(w in secured.lower() for w in ["secure", "collateral", "มีหลัก"]) else "🔓 ไม่มีหลักประกัน"
+        if secured and any(w in secured.lower() for w in ["secure", "collateral", "guaranteed"]):
+            secured_label = "🔒 มีหลักประกัน"
         else:
             secured_label = "🔓 ไม่มีหลักประกัน"
+
+        if coupon and coupon != "-" and "%" not in coupon:
+            coupon = f"{coupon}%"
 
         lines.append(
             f"\n🔹 {symbol}\n"
             f"  📅 ออก: {issue_date}\n"
             f"  📅 ครบกำหนด: {maturity}\n"
-            f"  💰 อัตราดอกเบี้ย: {coupon}%\n"
+            f"  💰 ดอกเบี้ย: {coupon}\n"
             f"  ⏳ อายุ: {tenor}\n"
             f"  {secured_label}\n"
             f"  🏦 ผู้จัดจำหน่าย: {underwriter}"
         )
 
-    lines.append("\n─" * 30)
-    lines.append("📌 ข้อมูลจาก ThaiBMA (www.thaibma.or.th)")
+    if len(bonds) > 10:
+        lines.append(f"\n... และอีก {len(bonds)-10} รุ่น")
+
+    lines.append("\n" + "─" * 28)
+    lines.append("📌 ข้อมูลจาก ThaiBMA")
     return "\n".join(lines)
