@@ -14,7 +14,6 @@ HEADERS = {
 
 BASE         = "https://www.thaibma.or.th"
 REGISSUE_URL = f"{BASE}/issuer/regissue"
-ISSUE_URL    = f"{BASE}/issue"
 ISSUER_URL   = f"{BASE}/EN/Issuer/IssuerDetail.aspx"
 BOND_PAGE    = f"{BASE}/EN/BondInfo/BondFeature/Issue.aspx"
 
@@ -41,31 +40,9 @@ def fmt_number(raw):
         return raw
 
 
-def warm_session(session):
-    """เข้าหน้าเว็บก่อนเพื่อได้ session cookie"""
-    try:
-        session.get(
-            BOND_PAGE,
-            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
-            timeout=15
-        )
-        logger.info("[session] warmed up")
-    except Exception as e:
-        logger.warning(f"[session] warm failed: {e}")
-
-
 def api_get(url, session, ref=None):
     try:
-        r = session.get(
-            url,
-            headers={**HEADERS, "Referer": ref or BOND_PAGE},
-            timeout=15
-        )
-        if r.status_code == 401 or "Authorization has been denied" in r.text:
-            logger.warning(f"[api_get] auth denied: {url} — retrying after warm")
-            warm_session(session)
-            time.sleep(0.5)
-            r = session.get(url, headers={**HEADERS, "Referer": ref or BOND_PAGE}, timeout=15)
+        r = session.get(url, headers={**HEADERS, "Referer": ref or BOND_PAGE}, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -73,55 +50,40 @@ def api_get(url, session, ref=None):
         return None
 
 
-def parse_participant(data, role):
+def parse_coupon_from_feature(data):
+    """ดึง coupon จาก feature API response"""
     if not data:
         return "-"
-    names = []
-    items = data if isinstance(data, list) else [data]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ["InstitutionName", "Name", "name", "institutionName"]:
-            n = item.get(key, "")
-            if n and str(n).strip():
-                names.append(str(n).strip())
-                break
-    result = " / ".join(names) if names else "-"
-    logger.info(f"[participant] {role}: {result[:80]}")
-    return result
+    logger.info(f"[feature] keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
+    logger.info(f"[feature] raw: {str(data)[:300]}")
 
-
-def parse_coupon(data):
-    if not data:
-        return "-"
-    logger.info(f"[coupon] raw: {str(data)[:200]}")
-    items = data if isinstance(data, list) else [data]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ["CouponRate", "couponRate", "Rate", "rate", "Value", "value",
-                    "Reference", "reference", "CouponValue", "couponValue"]:
-            val = item.get(key)
-            if val is None or str(val).strip() in ["", "null", "None", "-"]:
-                continue
-            v = str(val).strip()
-            m = re.search(r"Fixed\s*:?\s*([\d.]+)", v, re.I)
-            if m:
-                n = float(m.group(1))
-                if n < 1:
-                    n *= 100
-                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            try:
-                n = float(v)
-                if 0 < n <= 50:
-                    if n < 1:
-                        n *= 100
-                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            except ValueError:
-                pass
-            if any(k in v.upper() for k in ["FRN", "FLOAT", "MLR", "MOR", "TBR"]):
-                return v[:40]
+    if isinstance(data, dict):
+        # หา coupon จาก field ต่างๆ
+        for key in ["CouponRate", "couponRate", "Coupon", "coupon", "Rate", "rate",
+                    "InterestRate", "interestRate", "CouponPayment"]:
+            val = data.get(key)
+            if val is not None and str(val).strip() not in ["", "null", "None", "0", "0.0"]:
+                v = str(val).strip()
+                try:
+                    n = float(v)
+                    if 0 < n <= 50:
+                        if n < 1: n *= 100
+                        return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                except ValueError:
+                    if any(k in v.upper() for k in ["FRN", "FLOAT", "MLR", "MOR", "TBR", "FIXED"]):
+                        return v[:40]
     return "-"
+
+
+def clean_uw(val):
+    """กรอง garbage values ออกจาก Underwriter"""
+    if not val or val in ["-", ""]:
+        return "-"
+    blacklist = ["financial advisor", "remark", "note", "หมายเหตุ",
+                 "n/a", "none", "null", "-"]
+    if any(b in val.lower() for b in blacklist):
+        return "-"
+    return val
 
 
 # ─── STEP 1: Bond List ────────────────────────────────────────────────────────
@@ -168,8 +130,12 @@ def _item_to_bond(item, term_type):
     secure_code = g("SecureCode", "securedType", "SecuredType")
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
 
+    # เก็บ IssueID (UUID) สำหรับเรียก feature API
+    issue_id = g("IssueID", "issueId", "id", "Id")
+
     return {
         "symbol":           symbol,
+        "issue_id":         issue_id,
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
         "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
@@ -179,9 +145,10 @@ def _item_to_bond(item, term_type):
         "outstanding_size": fmt_number(g("CurrentOutstanding", "IssueOutstanding")),
         "secured_type":     secure_code,
         "secured_label":    secured_label,
+        # ดึงจาก regissue API ตรงๆ (มีอยู่แล้ว)
         "registrar":        g("Registrar", "registrar"),
         "bondholder_rep":   g("BondholderRepresentative"),
-        "underwriters":     "-",
+        "underwriters":     clean_uw(g("Underwriter", "underwriter")),
         "issue_rating":     g("IssueRating", "issueRating"),
         "issuer_rating":    g("CompanyRating", "issuerRating"),
         "distribution":     g("DistributionDisplay", "distribution"),
@@ -189,40 +156,32 @@ def _item_to_bond(item, term_type):
     }
 
 
-# ─── STEP 2: Coupon + Participants ────────────────────────────────────────────
+# ─── STEP 2: Feature API (public — ใช้ UUID) ─────────────────────────────────
 
-def fetch_bond_apis(symbol, session):
-    detail = {}
-    ref = BOND_PAGE
+def fetch_feature(issue_id, symbol, session):
+    """ลอง feature API ด้วย UUID เพื่อดึง coupon rate"""
+    if not issue_id or issue_id == "-":
+        return {}
 
-    # Coupon
-    coupon_data = api_get(f"{ISSUE_URL}/couponpaymentreference?Symbol={symbol}", session, ref)
-    coupon = parse_coupon(coupon_data)
-    if coupon != "-":
-        detail["coupon_rate"] = coupon
-    time.sleep(0.2)
+    # ลอง feature API ด้วย UUID (เห็นใน Network tab ว่าใช้ UUID uppercase)
+    uuid_upper = issue_id.upper()
+    urls_to_try = [
+        f"{BASE}/issue/feature?Symbol={uuid_upper}",
+        f"{BASE}/issue/feature?Symbol={issue_id}",
+        f"{BASE}/bondinfo/feature?Symbol={uuid_upper}",
+        f"{BASE}/EN/BondInfo/feature?Symbol={uuid_upper}",
+    ]
 
-    # Underwriter
-    uw_data = api_get(f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=UDW", session, ref)
-    uw = parse_participant(uw_data, "UDW")
-    if uw != "-":
-        detail["underwriters"] = uw
-    time.sleep(0.2)
+    for url in urls_to_try:
+        data = api_get(url, session, BOND_PAGE)
+        if data:
+            logger.info(f"[feature] success: {url}")
+            coupon = parse_coupon_from_feature(data)
+            if coupon != "-":
+                return {"coupon_rate": coupon}
 
-    # BH Rep
-    rept_data = api_get(f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=REPT", session, ref)
-    rept = parse_participant(rept_data, "REPT")
-    if rept != "-":
-        detail["bondholder_rep"] = rept
-    time.sleep(0.2)
-
-    # Registrar
-    regt_data = api_get(f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=REGT", session, ref)
-    regt = parse_participant(regt_data, "REGT")
-    if regt != "-":
-        detail["registrar"] = regt
-
-    return detail
+    logger.info(f"[feature] all URLs failed for {issue_id}")
+    return {}
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -232,22 +191,23 @@ def search_bonds_by_company(company_name):
     abbr = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
 
-    # warm session ก่อน
-    warm_session(session)
-
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
 
     results = []
     for b in bonds[:15]:
-        symbol = b.get("symbol", "")
-        if symbol:
-            time.sleep(0.2)
-            detail = fetch_bond_apis(symbol, session)
-            for k, v in detail.items():
+        issue_id = b.get("issue_id", "-")
+        symbol   = b.get("symbol", "")
+
+        # ลองดึง coupon จาก feature API
+        if b.get("coupon_rate", "-") == "-" and issue_id != "-":
+            time.sleep(0.3)
+            feature_detail = fetch_feature(issue_id, symbol, session)
+            for k, v in feature_detail.items():
                 if k not in b or b[k] == "-":
                     b[k] = v
+
         results.append(b)
 
     logger.info(f"[main] Done: {len(results)} bonds")
