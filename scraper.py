@@ -510,17 +510,7 @@ def format_bond_message(bonds, company_name):
 
     add_bonds(long_bonds,  "📌 Long Term Debenture")
     add_bonds(short_bonds, "📌 Short Term Debenture")
-    # เพิ่มข้อมูล SEC offering ถ้ามี
-    try:
-        from sec_scraper import search_sec_offerings, format_sec_section
-        offerings = search_sec_offerings(company_name)
-        sec_text  = format_sec_section(offerings)
-        if sec_text:
-            lines.extend(["", sec_text])
-    except Exception as _e:
-        logger.warning(f"[sec] skip: {_e}")
-
-    lines.extend(["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA & SEC"])
+    lines.extend(["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"])
     full_text = "\n".join(lines)
 
     # Split into chunks < 4800 chars (LINE limit = 5000)
