@@ -15,15 +15,16 @@ THAIBMA_PASSWORD = os.environ.get("THAIBMA_PASSWORD", "")
 BASE_IBOND   = "https://www.ibond.thaibma.or.th"
 BASE_THAIBMA = "https://www.thaibma.or.th"
 REGISSUE_URL = f"{BASE_THAIBMA}/issuer/regissue"
-ISSUE_URL    = f"{BASE_THAIBMA}/issue"
 ISSUER_URL   = f"{BASE_THAIBMA}/EN/Issuer/IssuerDetail.aspx"
+
+GRPC_BASE    = f"{BASE_IBOND}/grpc/bond-grpc"
 
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
 }
 
-# ─── gRPC-web-text helpers ────────────────────────────────────────────────────
+# ─── gRPC-web helpers ─────────────────────────────────────────────────────────
 
 def _encode_varint(n):
     result = []
@@ -34,57 +35,67 @@ def _encode_varint(n):
     return bytes(result)
 
 def _proto_string(field_num, value):
-    """Encode protobuf string field"""
     b = value.encode("utf-8") if isinstance(value, str) else value
     tag = (field_num << 3) | 2
     return bytes([tag]) + _encode_varint(len(b)) + b
 
 def _grpc_encode(proto_bytes):
-    """Wrap protobuf in gRPC-web-text frame → base64 string"""
     header = struct.pack(">BI", 0, len(proto_bytes))
     return base64.b64encode(header + proto_bytes).decode("ascii")
 
-def _grpc_decode(b64_text):
-    """Decode gRPC-web-text response → protobuf bytes"""
+def _grpc_decode_all(b64_text):
+    """Decode gRPC-web-text — may contain multiple frames"""
     try:
         raw = base64.b64decode(b64_text + "==")
-        if len(raw) < 5:
-            return None
-        length = struct.unpack(">I", raw[1:5])[0]
-        return raw[5:5 + length]
     except Exception:
-        return None
+        return []
+    frames = []
+    i = 0
+    while i + 5 <= len(raw):
+        flag = raw[i]
+        length = struct.unpack(">I", raw[i+1:i+5])[0]
+        i += 5
+        if flag == 0 and length > 0:
+            frames.append(raw[i:i+length])
+        i += length
+    return frames
 
-def _proto_read_string(data, field_num):
-    """Read first string field with given number from protobuf bytes"""
+def _proto_extract_all_strings(data):
+    """Extract all string values from protobuf bytes"""
+    results = {}
     i = 0
     while i < len(data):
         try:
-            tag = data[i]; i += 1
-            f = tag >> 3
-            wt = tag & 0x07
-            if wt == 2:
-                # read varint length
+            tag_byte = data[i]; i += 1
+            field_num = tag_byte >> 3
+            wire_type = tag_byte & 0x07
+            if wire_type == 2:
                 length = 0; shift = 0
                 while True:
                     b = data[i]; i += 1
                     length |= (b & 0x7f) << shift
                     shift += 7
                     if not (b & 0x80): break
-                val = data[i:i + length]; i += length
-                if f == field_num:
-                    return val.decode("utf-8", errors="replace")
-            elif wt == 0:
-                while data[i] & 0x80: i += 1
-                i += 1
+                val_bytes = data[i:i+length]; i += length
+                try:
+                    results[field_num] = val_bytes.decode("utf-8", errors="replace")
+                except Exception:
+                    results[field_num] = val_bytes.hex()
+            elif wire_type == 0:
+                val = 0; shift = 0
+                while True:
+                    b = data[i]; i += 1
+                    val |= (b & 0x7f) << shift
+                    shift += 7
+                    if not (b & 0x80): break
+                results[field_num] = val
             else:
                 break
         except Exception:
             break
-    return None
+    return results
 
-
-# ─── Login to iBond → get Bearer token ───────────────────────────────────────
+# ─── Login ────────────────────────────────────────────────────────────────────
 
 _cached_token = None
 
@@ -92,14 +103,11 @@ def get_bearer_token(session):
     global _cached_token
     if _cached_token:
         return _cached_token
-
     if not THAIBMA_USERNAME or not THAIBMA_PASSWORD:
-        logger.warning("[login] No credentials in env vars")
         return None
 
     proto = _proto_string(1, THAIBMA_USERNAME) + _proto_string(2, THAIBMA_PASSWORD)
     payload = _grpc_encode(proto)
-
     headers = {
         **HEADERS_BASE,
         "Accept": "application/grpc-web-text",
@@ -108,61 +116,101 @@ def get_bearer_token(session):
         "Origin": BASE_IBOND,
         "Referer": f"{BASE_IBOND}/login",
     }
-
     try:
         resp = session.post(
             f"{BASE_IBOND}/grpc/authen-grpc/authen.AuthenGrpcService/Authenticate",
-            data=payload,
-            headers=headers,
-            timeout=20,
+            data=payload, headers=headers, timeout=20,
         )
-        logger.info(f"[login] status={resp.status_code}, len={len(resp.text)}")
-
-        if resp.status_code != 200:
-            logger.warning(f"[login] failed: {resp.text[:100]}")
-            return None
-
-        proto_resp = _grpc_decode(resp.text)
-        if not proto_resp:
-            logger.warning(f"[login] decode failed. raw: {resp.text[:80]}")
-            return None
-
-        logger.info(f"[login] proto_resp bytes: {proto_resp[:30].hex()}")
-
-        # Token likely in field 1
-        token = _proto_read_string(proto_resp, 1)
-        if token and len(token) > 20:
-            _cached_token = token
-            logger.info(f"[login] token ok: {token[:30]}...")
-            return token
-
-        # Try field 2 if field 1 not right
-        token2 = _proto_read_string(proto_resp, 2)
-        if token2 and len(token2) > 20:
-            _cached_token = token2
-            logger.info(f"[login] token field2: {token2[:30]}...")
-            return token2
-
-        logger.warning(f"[login] no token. proto: {proto_resp.hex()}")
-        return None
-
+        logger.info(f"[login] status={resp.status_code}")
+        frames = _grpc_decode_all(resp.text)
+        for frame in frames:
+            fields = _proto_extract_all_strings(frame)
+            logger.info(f"[login] fields: { {k: str(v)[:40] for k,v in fields.items()} }")
+            for fnum, val in fields.items():
+                if isinstance(val, str) and len(val) > 30 and "." in val:
+                    _cached_token = val
+                    logger.info(f"[login] token field {fnum}: {val[:30]}...")
+                    return val
     except Exception as e:
         logger.exception(f"[login] error: {e}")
-        return None
+    return None
 
 
-# ─── API helpers ──────────────────────────────────────────────────────────────
+# ─── gRPC call to ibond ───────────────────────────────────────────────────────
 
-def api_get_json(url, session, token=None, ref=None):
+def grpc_call(service_path, proto_bytes, token, session):
+    """Call ibond gRPC-web API with Bearer token"""
+    payload = _grpc_encode(proto_bytes)
     headers = {
         **HEADERS_BASE,
-        "Accept": "application/json, */*",
-        "Referer": ref or BASE_THAIBMA,
+        "Accept": "application/grpc-web-text",
+        "Content-Type": "application/grpc-web-text",
+        "X-Grpc-Web": "1",
+        "Authorization": f"Bearer {token}",
+        "Origin": BASE_IBOND,
+        "Referer": f"{BASE_IBOND}/bondsearch/bondsearchpage",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     try:
-        r = session.get(url, headers=headers, timeout=15)
+        resp = session.post(
+            f"{BASE_IBOND}/grpc/{service_path}",
+            data=payload, headers=headers, timeout=20,
+        )
+        logger.info(f"[grpc] {service_path}: status={resp.status_code}, len={len(resp.text)}")
+        if resp.status_code != 200:
+            return []
+        return _grpc_decode_all(resp.text)
+    except Exception as e:
+        logger.warning(f"[grpc] {service_path}: {e}")
+        return []
+
+
+def get_coupon(symbol, token, session):
+    """Call GetCouponPayment gRPC"""
+    proto = _proto_string(1, symbol)
+    frames = grpc_call("bond-grpc/bond.BondGrpcService/GetCouponPayment", proto, token, session)
+    for frame in frames:
+        fields = _proto_extract_all_strings(frame)
+        logger.info(f"[coupon_grpc] fields: { {k: str(v)[:40] for k,v in fields.items()} }")
+        # หา field ที่เป็น coupon rate (น่าจะเป็น float หรือ string)
+        for fnum, val in fields.items():
+            if isinstance(val, (int, float)):
+                n = float(val)
+                if 0 < n <= 50:
+                    if n < 1: n *= 100
+                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+            if isinstance(val, str):
+                m = re.search(r"([\d.]+)\s*%?", val)
+                if m:
+                    try:
+                        n = float(m.group(1))
+                        if 0 < n <= 50:
+                            if n < 1: n *= 100
+                            return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                    except ValueError:
+                        pass
+    return "-"
+
+
+def get_participants(symbol, role_code, token, session):
+    """Call GetParticipants gRPC for UDW/REPT/REGT"""
+    # role field น่าจะเป็น field 2
+    proto = _proto_string(1, symbol) + _proto_string(2, role_code)
+    frames = grpc_call("bond-grpc/bond.BondGrpcService/GetParticipants", proto, token, session)
+    names = []
+    for frame in frames:
+        fields = _proto_extract_all_strings(frame)
+        logger.info(f"[participant_grpc] {role_code}: { {k: str(v)[:40] for k,v in fields.items()} }")
+        for fnum, val in fields.items():
+            if isinstance(val, str) and len(val) > 3 and val not in names:
+                names.append(val)
+    return " / ".join(names) if names else "-"
+
+
+# ─── REST API helpers ─────────────────────────────────────────────────────────
+
+def api_get(url, session, ref=None):
+    try:
+        r = session.get(url, headers={**HEADERS_BASE, "Accept": "application/json, */*", "Referer": ref or BASE_THAIBMA}, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -192,55 +240,6 @@ def fmt_number(raw):
         return raw
 
 
-def parse_coupon(data):
-    if not data:
-        return "-"
-    logger.info(f"[coupon] raw: {str(data)[:200]}")
-    items = data if isinstance(data, list) else [data]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ["CouponRate", "couponRate", "Rate", "rate", "Value", "value",
-                    "Reference", "reference"]:
-            val = item.get(key)
-            if val is None or str(val).strip() in ["", "null", "None", "0", "0.0", "-"]:
-                continue
-            v = str(val).strip()
-            m = re.search(r"Fixed\s*:?\s*([\d.]+)", v, re.I)
-            if m:
-                n = float(m.group(1))
-                if n < 1: n *= 100
-                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            try:
-                n = float(v)
-                if 0 < n <= 50:
-                    if n < 1: n *= 100
-                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            except ValueError:
-                pass
-            if any(k in v.upper() for k in ["FRN", "FLOAT", "MLR", "MOR", "TBR"]):
-                return v[:40]
-    return "-"
-
-
-def parse_participant(data, role):
-    if not data:
-        return "-"
-    names = []
-    items = data if isinstance(data, list) else [data]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ["InstitutionName", "Name", "name", "institutionName"]:
-            n = item.get(key, "")
-            if n and str(n).strip():
-                names.append(str(n).strip())
-                break
-    result = " / ".join(names) if names else "-"
-    logger.info(f"[participant] {role}: {result[:80]}")
-    return result
-
-
 # ─── Bond List ────────────────────────────────────────────────────────────────
 
 def fetch_bond_list(abbr_name, session):
@@ -248,28 +247,26 @@ def fetch_bond_list(abbr_name, session):
     ref = f"{ISSUER_URL}?issuer={abbr_name.lower()}"
     for term in ["long", "short"]:
         url = f"{REGISSUE_URL}?abbrName={abbr_name}&term={term}"
-        data = api_get_json(url, session, ref=ref)
+        data = api_get(url, session, ref)
         if not data:
             continue
         items = data if isinstance(data, list) else []
         if isinstance(data, dict):
             for key in ["data", "result", "bonds", "items", "records", "value"]:
                 if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
+                    items = data[key]; break
         for item in items:
             bond = _item_to_bond(item, term)
             if bond:
                 all_bonds.append(bond)
         logger.info(f"[api] {term}: {len(items)} items")
-    logger.info(f"[api] Total: {len(all_bonds)} bonds")
+    logger.info(f"[api] Total: {len(all_bonds)}")
     return all_bonds
 
 
 def _item_to_bond(item, term_type):
     if not isinstance(item, dict):
         return None
-
     def g(*keys):
         for k in keys:
             if k in item and item[k] is not None:
@@ -277,14 +274,11 @@ def _item_to_bond(item, term_type):
                 if v and v not in ["", "null", "None"]:
                     return v
         return "-"
-
     symbol = g("Symbol", "symbol", "ThaiBMASymbol")
     if symbol == "-":
         return None
-
     secure_code = g("SecureCode", "securedType", "SecuredType")
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
-
     return {
         "symbol":           symbol,
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
@@ -302,57 +296,7 @@ def _item_to_bond(item, term_type):
         "issuer_rating":    g("CompanyRating", "issuerRating"),
         "distribution":     g("DistributionDisplay", "distribution"),
         "isin":             g("IssueLegacyID", "isinCode"),
-        "option":           g("OptionCode", "optionCode"),
     }
-
-
-# ─── Fetch coupon + participants using Bearer token ───────────────────────────
-
-def fetch_bond_detail_with_token(symbol, token, session):
-    detail = {}
-    ref = f"{BASE_THAIBMA}/EN/BondInfo/BondFeature/Issue.aspx"
-
-    # Coupon
-    coupon_data = api_get_json(
-        f"{ISSUE_URL}/couponpaymentreference?Symbol={symbol}",
-        session, token=token, ref=ref
-    )
-    coupon = parse_coupon(coupon_data)
-    if coupon != "-":
-        detail["coupon_rate"] = coupon
-        logger.info(f"[detail] coupon: {coupon}")
-    time.sleep(0.2)
-
-    # Underwriter
-    uw_data = api_get_json(
-        f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=UDW",
-        session, token=token, ref=ref
-    )
-    uw = parse_participant(uw_data, "UDW")
-    if uw != "-":
-        detail["underwriters"] = uw
-    time.sleep(0.2)
-
-    # BH Rep
-    rept_data = api_get_json(
-        f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=REPT",
-        session, token=token, ref=ref
-    )
-    rept = parse_participant(rept_data, "REPT")
-    if rept != "-":
-        detail["bondholder_rep"] = rept
-    time.sleep(0.2)
-
-    # Registrar
-    regt_data = api_get_json(
-        f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=REGT",
-        session, token=token, ref=ref
-    )
-    regt = parse_participant(regt_data, "REGT")
-    if regt != "-":
-        detail["registrar"] = regt
-
-    return detail
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -362,27 +306,31 @@ def search_bonds_by_company(company_name):
     abbr = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
 
-    # Login → get token
     token = get_bearer_token(session)
-    logger.info(f"[main] token available: {bool(token)}")
+    logger.info(f"[main] token: {bool(token)}")
 
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
 
-    results = []
     for b in bonds[:15]:
         symbol = b.get("symbol", "")
         if symbol and token:
+            time.sleep(0.3)
+            coupon = get_coupon(symbol, token, session)
+            if coupon != "-":
+                b["coupon_rate"] = coupon
             time.sleep(0.2)
-            detail = fetch_bond_detail_with_token(symbol, token, session)
-            for k, v in detail.items():
-                if k not in b or b[k] == "-":
-                    b[k] = v
-        results.append(b)
+            uw = get_participants(symbol, "UDW", token, session)
+            if uw != "-":
+                b["underwriters"] = uw
+            time.sleep(0.2)
+            rept = get_participants(symbol, "REPT", token, session)
+            if rept != "-":
+                b["bondholder_rep"] = rept
 
-    logger.info(f"[main] Done: {len(results)} bonds")
-    return results
+    logger.info(f"[main] Done: {len(bonds)} bonds")
+    return bonds
 
 
 # ─── FORMAT ───────────────────────────────────────────────────────────────────
