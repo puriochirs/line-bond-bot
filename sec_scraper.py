@@ -63,7 +63,7 @@ def extract_coupon_from_pdf_url(pdf_url: str, session: requests.Session) -> str:
     """Download PDF และ parse หา coupon rate — คืน '-' ถ้าไม่เจอ"""
     try:
         logger.info(f"[pdf] downloading: {pdf_url}")
-        resp = session.get(pdf_url, headers=HTML_HEADERS, timeout=20, stream=True)
+        resp = session.get(pdf_url, headers=HTML_HEADERS, timeout=10, stream=True)
         if resp.status_code != 200:
             return "-"
 
@@ -71,7 +71,7 @@ def extract_coupon_from_pdf_url(pdf_url: str, session: requests.Session) -> str:
         pdf_bytes = b""
         for chunk in resp.iter_content(chunk_size=65536):
             pdf_bytes += chunk
-            if len(pdf_bytes) > 500_000:
+            if len(pdf_bytes) > 200_000:
                 break
 
         return parse_coupon_from_pdf_bytes(pdf_bytes)
@@ -124,7 +124,7 @@ def parse_coupon_from_pdf_bytes(pdf_bytes: bytes) -> str:
 def get_pdf_link_from_filing_page(filing_url: str, session: requests.Session) -> str:
     """เข้าหน้า filing → หา PDF link ที่เป็น Fact Sheet / Prospectus"""
     try:
-        resp = session.get(filing_url, headers=HTML_HEADERS, timeout=15)
+        resp = session.get(filing_url, headers=HTML_HEADERS, timeout=8)
         if resp.status_code != 200:
             return ""
         soup = BeautifulSoup(resp.text, "lxml")
@@ -269,11 +269,15 @@ def parse_debenture_table(html: str, soup: BeautifulSoup,
 
         if filing_link:
             logger.info(f"[sec] filing link: {filing_link}")
-            pdf_url = get_pdf_link_from_filing_page(filing_link, session)
-            if pdf_url:
-                coupon_rate = extract_coupon_from_pdf_url(pdf_url, session)
-            else:
-                logger.info(f"[sec] no PDF found in filing page")
+            # ลอง parse PDF แบบ best-effort ถ้า timeout ก็ข้ามไป
+            try:
+                pdf_url = get_pdf_link_from_filing_page(filing_link, session)
+                if pdf_url:
+                    coupon_rate = extract_coupon_from_pdf_url(pdf_url, session)
+                else:
+                    logger.info(f"[sec] no PDF found")
+            except Exception as pdf_err:
+                logger.warning(f"[sec] PDF skip: {pdf_err}")
 
         results.append({
             "bond_name":   shorten_bond_name(bond_name),
