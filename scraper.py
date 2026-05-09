@@ -148,6 +148,25 @@ SECURITIES_ABBR = {
     "RHB SECURITIES": "RHB",
     "TISCO": "TISCO",
     "YUANTA": "YUANTA",
+    "APOLLO WEALTH": "APW",
+    "DAOL SECURITIES": "DAOL",
+    "DAOL": "DAOL",
+    "MERCHANT PARTNERS": "MPS",
+    "UOB KAY HIAN": "UOBKH",
+    "UOB KAYHIAN": "UOBKH",
+    "GLOBLEX": "GLBL",
+    "THANACHART": "TISCO",
+    "ONE ASSET": "ONE",
+    "LAND AND HOUSES": "LH",
+    "CAPITAL ONE": "CAP1",
+    "EKKAPHAN": "EKP",
+    "FSS INTERNATIONAL": "FSSI",
+    "FINANSIA": "FSS",
+    "MACQUARIE": "MQG",
+    "STANDARD CHARTERED": "SCB",
+    "CITIGROUP": "CITI",
+    "DEUTSCHE": "DB",
+    "MERRILL LYNCH": "ML",
     "MBK SECURITIES": "MBKS",
     "PHILLIP": "PST",
     "DBS VICKERS": "DBS",
@@ -315,6 +334,8 @@ def get_bond_detail(symbol, issue_uuid, token, session):
                     abbr = clean_participant(s)
                     if abbr and abbr not in uw_list:
                         uw_list.append(abbr)
+                        if len(uw_list) >= 4:  # จำกัดไม่เกิน 4 บริษัท
+                            break
                 elif fnum == 12:
                     abbr = clean_participant(s)
                     if abbr and abbr not in bh_list:
@@ -481,4 +502,22 @@ def format_bond_message(bonds, company_name):
     add_bonds(long_bonds,  "📌 Long Term Debenture")
     add_bonds(short_bonds, "📌 Short Term Debenture")
     lines.extend(["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"])
-    return "\n".join(lines)
+    full_text = "\n".join(lines)
+
+    # Split into chunks < 4800 chars (LINE limit = 5000)
+    if len(full_text) <= 4800:
+        return full_text
+
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 4800:
+            if current:
+                chunks.append(current.rstrip())
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    return "\n---\n".join(chunks)  # caller splits on ---
