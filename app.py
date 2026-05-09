@@ -175,9 +175,9 @@ def handle_message(event: dict):
 def _do_search(user_text: str, reply_token: str, push_to: str):
     """ค้นหา bond และส่งผลลัพธ์"""
     try:
-        bonds = search_bonds_by_company(user_text)
+        bonds, sec_future = search_bonds_by_company(user_text)
         logger.info(f"[search] Got {len(bonds)} bonds for '{user_text}'")
-        response_msg = format_bond_message(bonds, user_text)
+        response_msg = format_bond_message(bonds, user_text, sec_future=sec_future)
         logger.info(f"[search] Formatted {len(response_msg)} chars")
     except Exception as e:
         logger.exception(f"[search] Error: {e}")
