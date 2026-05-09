@@ -128,13 +128,78 @@ def extract_coupon_from_raw(frame):
     return "-"
 
 
+
+# ── ชื่อย่อบริษัทหลักทรัพย์ไทย ──────────────────────────────────────────────
+SECURITIES_ABBR = {
+    "KRUNGTHAI XSPRING": "KTX",
+    "KTX": "KTX",
+    "ASIA PLUS": "ASPS",
+    "KASIKORN": "KS",
+    "BUALUANG": "BLS",
+    "SCB SECURITIES": "SCBS",
+    "PHATRA": "PHATRA",
+    "TRINITY": "TRINITY",
+    "CIMB SECURITIES": "CIMBS",
+    "CGS-CIMB": "CGS",
+    "CGS CIMB": "CGS",
+    "FINANSIA SYRUS": "FSS",
+    "KGI SECURITIES": "KGI",
+    "MAYBANK": "MBS",
+    "RHB SECURITIES": "RHB",
+    "TISCO": "TISCO",
+    "YUANTA": "YUANTA",
+    "MBK SECURITIES": "MBKS",
+    "PHILLIP": "PST",
+    "DBS VICKERS": "DBS",
+    "GLOBLEX": "GLBL",
+    "SEAMICO": "ZMICO",
+    "ZMICO": "ZMICO",
+    "UOB KAY HIAN": "UOBKH",
+    "KRUNGSRI": "KSS",
+    "BANGKOK SECURITIES": "BS",
+    "หลักทรัพย์กรุงไทย เอ็กซ์สปริง": "KTX",
+    "หลักทรัพย์เอเซีย พลัส": "ASPS",
+    "หลักทรัพย์กสิกรไทย": "KS",
+    "หลักทรัพย์บัวหลวง": "BLS",
+}
+
+
+def abbr_company(name):
+    """แปลงชื่อเต็มเป็นชื่อย่อ"""
+    if not name or name == "-":
+        return name
+    upper = name.upper()
+    for key, abbr in SECURITIES_ABBR.items():
+        if key.upper() in upper:
+            return abbr
+    # ถ้าไม่มีใน mapping ตัดคำว่า SECURITIES/COMPANY/LIMITED ออก
+    name = re.sub(r'\s*(SECURITIES|COMPANY|LIMITED|CO\.,?\s*LTD\.?|PUBLIC)\s*', ' ', name, flags=re.I)
+    name = name.strip().rstrip(',').strip()
+    return name
+
+
 def clean_participant(val):
-    """ตัดเบอร์โทรออก: 'KRUNGTHAI XSPRING...:02-695-5555' → 'KRUNGTHAI XSPRING...'"""
+    """ตัดเบอร์โทรออก แล้วแปลงเป็นชื่อย่อ"""
     if not val or val == "-":
         return val
+    # ตัดเบอร์โทร (ส่วนหลัง ":")
     if ":" in val:
         val = val.split(":")[0].strip()
-    return val.strip()
+    return abbr_company(val.strip())
+
+
+def abbr_participants(names_str):
+    """แปลง list ชื่อ (คั่นด้วย / ) เป็นชื่อย่อ"""
+    if not names_str or names_str == "-":
+        return names_str
+    parts = [p.strip() for p in names_str.split("/") if p.strip()]
+    abbrs = [abbr_company(p.split(":")[0].strip()) for p in parts]
+    # กรองซ้ำ
+    seen = []
+    for a in abbrs:
+        if a not in seen:
+            seen.append(a)
+    return " / ".join(seen)
 
 
 # ─── Login ────────────────────────────────────────────────────────────────────
@@ -223,16 +288,26 @@ def get_bond_detail(symbol, issue_uuid, token, session):
         result["coupon_rate"] = coupon
 
     # ── Underwriter (field 11) & BH Rep (field 12) ──
+    uw_list = []
+    bh_list = []
     for fnum, wtype, val in _parse_proto(frame):
         if wtype == 2:
             s = _decode_str(val)
             if s and len(s) > 3:
                 if fnum == 11:
-                    result["underwriters"] = clean_participant(s)
-                    logger.info(f"[GetBondFeature] UW: {result['underwriters'][:60]}")
+                    abbr = clean_participant(s)
+                    if abbr and abbr not in uw_list:
+                        uw_list.append(abbr)
                 elif fnum == 12:
-                    result["bondholder_rep"] = clean_participant(s)
-                    logger.info(f"[GetBondFeature] BH Rep: {result['bondholder_rep'][:60]}")
+                    abbr = clean_participant(s)
+                    if abbr and abbr not in bh_list:
+                        bh_list.append(abbr)
+    if uw_list:
+        result["underwriters"] = " / ".join(uw_list)
+        logger.info(f"[GetBondFeature] UW: {result['underwriters']}")
+    if bh_list:
+        result["bondholder_rep"] = " / ".join(bh_list)
+        logger.info(f"[GetBondFeature] BH Rep: {result['bondholder_rep']}")
 
     return result
 
