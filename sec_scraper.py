@@ -63,7 +63,7 @@ def extract_coupon_from_pdf_url(pdf_url: str, session: requests.Session) -> str:
     """Download PDF และ parse หา coupon rate — คืน '-' ถ้าไม่เจอ"""
     try:
         logger.info(f"[pdf] downloading: {pdf_url}")
-        resp = session.get(pdf_url, headers=HTML_HEADERS, timeout=10, stream=True)
+        resp = session.get(pdf_url, headers=HTML_HEADERS, timeout=60, stream=True)
         if resp.status_code != 200:
             return "-"
 
@@ -124,7 +124,7 @@ def parse_coupon_from_pdf_bytes(pdf_bytes: bytes) -> str:
 def get_pdf_link_from_filing_page(filing_url: str, session: requests.Session) -> str:
     """เข้าหน้า filing → หา PDF link ที่เป็น Fact Sheet / Prospectus"""
     try:
-        resp = session.get(filing_url, headers=HTML_HEADERS, timeout=8)
+        resp = session.get(filing_url, headers=HTML_HEADERS, timeout=60)
         if resp.status_code != 200:
             return ""
         soup = BeautifulSoup(resp.text, "lxml")
