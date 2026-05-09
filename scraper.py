@@ -45,6 +45,8 @@ def fmt_number(raw: str) -> str:
         return raw
 
 
+# ─── STEP 1: Bond List from JSON API ─────────────────────────────────────────
+
 def fetch_bond_list(abbr_name: str, session: requests.Session) -> list:
     all_bonds = []
     ref = f"{ISSUER_DETAIL}?issuer={abbr_name.lower()}"
@@ -87,9 +89,6 @@ def _item_to_bond(item: dict, term_type: str):
     if symbol == "-":
         return None
 
-    # Log all keys in first item for debugging
-    logger.info(f"[item] {symbol} keys: {list(item.keys())}")
-
     secure_code = g("SecureCode", "securedType", "SecuredType")
     if "unsecure" in secure_code.lower() or secure_code == "-":
         secured_label = "🔓 ไม่มีหลักประกัน"
@@ -116,52 +115,86 @@ def _item_to_bond(item: dict, term_type: str):
         "isin":             g("IssueLegacyID", "isinCode", "ISIN"),
     }
 
-    # Log IssueID format
     issue_id = g("IssueID", "issueId", "id", "Id")
-    logger.info(f"[item] {symbol} IssueID='{issue_id}' IssueLegacyID='{g('IssueLegacyID')}'")
-
     if issue_id != "-":
         bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
-    
-    # Fallback: try using IssueLegacyID (ISIN) to build URL
-    legacy = g("IssueLegacyID")
-    if legacy != "-" and not bond.get("detail_url"):
-        bond["detail_url"] = f"{BOND_INFO_URL}?symbol={legacy}"
 
     return bond
 
 
+# ─── STEP 2: Bond Detail Page ─────────────────────────────────────────────────
+
 def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
+    """
+    ดึงข้อมูลจากหน้า bond detail
+    รองรับ multi-row tables เช่น Coupon Payment ที่ label/value อยู่คนละแถว
+    """
     detail = {}
     if not detail_url:
         return detail
     try:
         logger.info(f"[detail] Fetching: {detail_url}")
         resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
-        logger.info(f"[detail] Status: {resp.status_code}, len={len(resp.text)}")
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # Log all label-value pairs found
-        all_pairs = []
         for table in soup.find_all("table"):
-            for row in table.find_all("tr"):
+            rows = table.find_all("tr")
+            pending_label = None  # label ที่รอ value จากแถวถัดไป
+
+            for row in rows:
                 cells = row.find_all(["td", "th"])
-                pairs = []
-                for i in range(0, len(cells)-1, 2):
-                    pairs.append((cells[i].get_text(strip=True).lower(),
-                                  cells[i+1].get_text(" ", strip=True)))
-                if len(cells) == 4:
-                    pairs.append((cells[2].get_text(strip=True).lower(),
-                                  cells[3].get_text(" ", strip=True)))
-                for label, value in pairs:
-                    if label and value.strip():
-                        all_pairs.append(f"{label}={value[:40]}")
+                if not cells:
+                    continue
+
+                first_cell_text = cells[0].get_text(strip=True).lower()
+                all_text = " ".join(c.get_text(strip=True) for c in cells)
+
+                # ── กรณี: label อยู่ซ้าย value อยู่ขวา (2+ cells, same row) ──
+                if len(cells) >= 2:
+                    label = first_cell_text
+                    value = cells[1].get_text(" ", strip=True)
                     _assign(detail, label, value)
 
-        logger.info(f"[detail] pairs found: {all_pairs[:20]}")
-        logger.info(f"[detail] coupon_rate={detail.get('coupon_rate','MISSING')}, underwriters={detail.get('underwriters','MISSING')}")
+                    # 4-cell row: 2 pairs
+                    if len(cells) >= 4:
+                        label2 = cells[2].get_text(strip=True).lower()
+                        value2 = cells[3].get_text(" ", strip=True)
+                        _assign(detail, label2, value2)
 
+                # ── กรณีพิเศษ: "Coupon Payment" เป็น label ของ section ──
+                # แถวนี้มี "coupon payment" และ sub-headers เช่น Reference/Max/Min/From/To
+                if "coupon payment" in first_cell_text or "coupon payment" in all_text.lower():
+                    pending_label = "coupon payment"
+                    continue
+
+                # ── ถ้ามี pending_label รอ value จากแถวนี้ ──
+                if pending_label == "coupon payment" and detail.get("coupon_rate", "-") == "-":
+                    # หา "Fixed: X.X%" ในแถวนี้
+                    for cell in cells:
+                        cell_text = cell.get_text(strip=True)
+                        m = re.search(r"Fixed:\s*([\d.]+)\s*%?", cell_text, re.I)
+                        if m:
+                            detail["coupon_rate"] = m.group(1) + "%"
+                            logger.info(f"[detail] coupon found (multi-row): {detail['coupon_rate']}")
+                            pending_label = None
+                            break
+                        # FRN หรือ Floating rate
+                        if any(k in cell_text.lower() for k in ["frn", "floating", "tbr", "mlr", "mor"]):
+                            detail["coupon_rate"] = cell_text[:40]
+                            pending_label = None
+                            break
+
+                # ── Underwriter(s): อาจอยู่หลายแถว ──
+                if "underwriter" in first_cell_text:
+                    # เก็บทุก cell ที่ไม่ใช่ label
+                    uw_parts = [c.get_text(strip=True) for c in cells[1:] if c.get_text(strip=True)]
+                    if uw_parts:
+                        existing = detail.get("underwriters", "")
+                        new_part = " / ".join(uw_parts)
+                        detail["underwriters"] = (existing + " / " + new_part).strip(" /") if existing and existing != "-" else new_part
+
+        # สร้าง secured label จาก detail
         st = detail.get("secured_type", "").lower()
         bt = detail.get("bond_type", "").lower()
         if "unsecure" in st or "unsecure" in bt:
@@ -169,10 +202,14 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
         elif "secure" in st or "fasset" in st or "secure" in bt:
             detail["secured_label"] = "🔒 มีหลักประกัน"
 
+        logger.info(f"[detail] result: coupon={detail.get('coupon_rate','?')}, uw={detail.get('underwriters','?')[:50]}")
+
     except Exception as e:
         logger.exception(f"[detail] error: {e}")
     return detail
 
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def search_bonds_by_company(company_name: str) -> list:
     session = requests.Session()
@@ -194,6 +231,8 @@ def search_bonds_by_company(company_name: str) -> list:
     logger.info(f"[main] Done: {len(results)} bonds")
     return results
 
+
+# ─── FORMAT ───────────────────────────────────────────────────────────────────
 
 def format_bond_message(bonds: list, company_name: str) -> str:
     if not bonds:
@@ -234,6 +273,8 @@ def format_bond_message(bonds: list, company_name: str) -> str:
     return "\n".join(lines)
 
 
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
 def _assign(d: dict, label: str, value: str):
     v = value.strip()
     if not label or not v or v in ["-", "null"]:
@@ -247,8 +288,12 @@ def _assign(d: dict, label: str, value: str):
     elif "issue term" in label:
         d["tenor"] = v.split("/")[0].strip()
     elif "coupon payment" in label:
+        # same-row case
         m = re.search(r"Fixed:\s*([\d.]+)", v, re.I)
-        d["coupon_rate"] = (m.group(1) + "%") if m else v[:80]
+        if m:
+            d["coupon_rate"] = m.group(1) + "%"
+        elif any(k in v.lower() for k in ["frn", "floating", "tbr", "mlr", "mor"]):
+            d["coupon_rate"] = v[:60]
     elif "bond type" in label:
         d["bond_type"] = v
     elif "secured type" in label or label == "collateral":
@@ -258,7 +303,11 @@ def _assign(d: dict, label: str, value: str):
     elif "debenture holder" in label or "bondholder rep" in label:
         d["bondholder_rep"] = v
     elif "underwriter" in label:
-        d["underwriters"] = v
+        existing = d.get("underwriters", "")
+        if not existing or existing == "-":
+            d["underwriters"] = v
+        elif v not in existing:
+            d["underwriters"] = existing + " / " + v
     elif "financial advisor" in label:
         d["financial_advisor"] = v
     elif "outstanding size" in label:
