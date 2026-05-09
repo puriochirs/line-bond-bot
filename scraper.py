@@ -179,97 +179,105 @@ def grpc_call(method, proto_bytes, token, session, referer=None):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── GetByPageUrl ─────────────────────────────────────────────────────────────
+# ─── GetBySymbol & GetBondFeature ─────────────────────────────────────────────
 
-def get_coupon_via_page_url(symbol, token, session):
+def get_coupon(symbol, issue_uuid, token, session):
     """
-    เรียก GetByPageUrl ด้วย URL path /bonds?symbol=PCLV268A
-    เหมือนกับที่ browser เรียกตอนโหลดหน้า bond detail
+    ลอง GetBySymbol และ GetBondFeature ซึ่งเห็นใน Network tab
+    ของหน้า ibond.thaibma.or.th/bonds?symbol=PCLV268A
     """
-    bond_url = f"/bonds?symbol={symbol}"
-    bond_page_ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
+    ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
 
-    # ลอง field ต่างๆ สำหรับ URL
-    for field_num in [1, 2, 3]:
-        proto  = _proto_string(field_num, bond_url)
-        frames = grpc_call("GetByPageUrl", proto, token, session, referer=bond_page_ref)
-        logger.info(f"[page_url] field={field_num} '{bond_url}': {len(frames)} frames")
-
+    # ลอง GetBySymbol ก่อน (1.1 kB — น่าจะมี coupon)
+    for proto in [
+        _proto_string(1, symbol),
+        _proto_string(1, symbol.upper()),
+        _proto_string(2, symbol),
+    ]:
+        frames = grpc_call("GetBySymbol", proto, token, session, referer=ref)
+        logger.info(f"[GetBySymbol] {symbol}: {len(frames)} frames")
         for frame in frames:
-            all_vals = _dump_all(frame)
-            logger.info(f"[page_url] f={field_num} vals: {str(all_vals)[:400]}")
+            vals = _dump_all(frame)
+            logger.info(f"[GetBySymbol] vals: {str(vals)[:400]}")
+            c = _extract_coupon(vals)
+            if c != "-":
+                logger.info(f"[GetBySymbol] coupon: {c}")
+                return c
 
-            coupon = _find_coupon_in_vals(all_vals)
-            if coupon != "-":
-                return coupon
-
-    # ลอง full URL
-    for field_num in [1]:
-        proto  = _proto_string(field_num, bond_page_ref)
-        frames = grpc_call("GetByPageUrl", proto, token, session, referer=bond_page_ref)
-        logger.info(f"[page_url] full url f={field_num}: {len(frames)} frames")
+    # ลอง GetBondFeature (1.8 kB)
+    for proto in [
+        _proto_string(1, symbol),
+        _proto_string(1, issue_uuid) if issue_uuid != "-" else None,
+    ]:
+        if proto is None:
+            continue
+        frames = grpc_call("GetBondFeature", proto, token, session, referer=ref)
+        logger.info(f"[GetBondFeature] {symbol}: {len(frames)} frames")
         for frame in frames:
-            all_vals = _dump_all(frame)
-            logger.info(f"[page_url] full url vals: {str(all_vals)[:400]}")
-            coupon = _find_coupon_in_vals(all_vals)
-            if coupon != "-":
-                return coupon
+            vals = _dump_all(frame)
+            logger.info(f"[GetBondFeature] vals: {str(vals)[:400]}")
+            c = _extract_coupon(vals)
+            if c != "-":
+                logger.info(f"[GetBondFeature] coupon: {c}")
+                return c
+
+    # ลอง GetBondHighlightFeature (1.4 kB)
+    for proto in [_proto_string(1, symbol)]:
+        frames = grpc_call("GetBondHighlightFeature", proto, token, session, referer=ref)
+        logger.info(f"[GetBondHighlightFeature] {symbol}: {len(frames)} frames")
+        for frame in frames:
+            vals = _dump_all(frame)
+            logger.info(f"[GetBondHighlightFeature] vals: {str(vals)[:400]}")
+            c = _extract_coupon(vals)
+            if c != "-":
+                return c
 
     return "-"
 
 
-def _find_coupon_in_vals(all_vals):
+def _extract_coupon(vals):
     """หา coupon rate จาก list ของ (path, value)"""
-    # หา "Fixed" ก่อน แล้วหาตัวเลขถัดไป
-    fixed_found = False
-    for path, val in all_vals:
-        if isinstance(val, str) and "fixed" in val.lower():
-            fixed_found = True
-        if fixed_found and isinstance(val, (int, float)):
-            n = float(val)
-            if 0.5 <= n <= 30:
-                if n < 1: n *= 100
-                result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                logger.info(f"[coupon_find] after Fixed: {path}={n} → {result}")
-                return result
-
-    # หา pattern "X.X%" ใน strings
-    for path, val in all_vals:
-        if isinstance(val, str):
-            m = re.search(r"\b(\d+\.?\d*)\s*%", val)
-            if m:
-                try:
-                    n = float(m.group(1))
-                    if 0.5 <= n <= 30:
-                        result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                        logger.info(f"[coupon_find] pct string {path}={val[:30]} → {result}")
-                        return result
-                except Exception:
-                    pass
-
-    # หา numbers ที่เป็น coupon range (ไม่ใช่ 1,2,3,4,5 ซึ่งเป็น sort order)
-    # coupon ควรมี decimal เช่น 7.5
-    for path, val in all_vals:
+    # ค้นหา "7.5" หรือตัวเลขที่มี decimal และอยู่ใน range coupon
+    for path, val in vals:
         if isinstance(val, (int, float)):
             n = float(val)
-            if 1.5 <= n <= 30 and n != int(n):  # มี decimal ไม่ใช่ integer
-                result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                logger.info(f"[coupon_find] decimal {path}={n} → {result}")
-                return result
+            # coupon rate ควรมี decimal part และอยู่ระหว่าง 0.5-30
+            if 0.5 <= n <= 30 and n != int(n):
+                if n < 1: n *= 100
+                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+
+    # ค้นหาใน string ที่มี % หรือ pattern coupon
+    for path, val in vals:
+        if isinstance(val, str):
+            # รูปแบบ "7.5%" หรือ "7.50"
+            m = re.search(r"\b(\d+\.\d+)\s*%", val)
+            if m:
+                n = float(m.group(1))
+                if 0.5 <= n <= 30:
+                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+            # รูปแบบ coupon ใน JSON-like string
+            m2 = re.search(r'"coupon[^"]*"\s*:\s*"?(\d+\.?\d*)"?', val, re.I)
+            if m2:
+                n = float(m2.group(1))
+                if 0.5 <= n <= 30:
+                    if n < 1: n *= 100
+                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
 
     return "-"
 
 
 # ─── GetParticipants ──────────────────────────────────────────────────────────
 
-def get_participants(issue_uuid, symbol, role, token, session):
-    # ลอง UUID ก่อน
+def get_participants(symbol, issue_uuid, role, token, session):
+    ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
     for proto in [
-        _proto_string(1, issue_uuid) + _proto_string(2, role),
-        _proto_string(1, issue_uuid),
         _proto_string(1, symbol) + _proto_string(2, role),
+        _proto_string(1, issue_uuid) + _proto_string(2, role) if issue_uuid != "-" else None,
+        _proto_string(1, symbol),
     ]:
-        frames = grpc_call("GetParticipants", proto, token, session)
+        if proto is None:
+            continue
+        frames = grpc_call("GetParticipants", proto, token, session, referer=ref)
         names = []
         for frame in frames:
             for fnum, wtype, val in _parse_proto(frame):
@@ -277,7 +285,7 @@ def get_participants(issue_uuid, symbol, role, token, session):
                     s = _decode_str(val)
                     if s and len(s) > 3 and s not in names:
                         names.append(s)
-                    elif not s:
+                    elif not s and len(val) > 2:
                         for sf, sw, sv in _parse_proto(val):
                             if sw == 2:
                                 ss = _decode_str(sv)
@@ -361,7 +369,6 @@ def _item_to_bond(item, term_type):
     return {
         "symbol":           symbol,
         "issue_id":         g("IssueID", "issueId"),
-        "issuer_id":        g("IssuerID", "issuerId"),
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
         "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
@@ -398,19 +405,18 @@ def search_bonds_by_company(company_name):
         if not symbol or not token:
             continue
 
-        # ลอง GetByPageUrl ด้วย /bonds?symbol=PCLV268A
         time.sleep(0.3)
-        coupon = get_coupon_via_page_url(symbol, token, session)
+        coupon = get_coupon(symbol, issue_id, token, session)
         if coupon != "-":
             b["coupon_rate"] = coupon
 
         time.sleep(0.2)
-        uw = get_participants(issue_id, symbol, "UDW", token, session)
+        uw = get_participants(symbol, issue_id, "UDW", token, session)
         if uw != "-":
             b["underwriters"] = uw
 
         time.sleep(0.2)
-        rept = get_participants(issue_id, symbol, "REPT", token, session)
+        rept = get_participants(symbol, issue_id, "REPT", token, session)
         if rept != "-":
             b["bondholder_rep"] = rept
 
