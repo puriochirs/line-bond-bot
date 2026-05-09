@@ -5,6 +5,7 @@ import requests
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -459,16 +460,29 @@ def search_bonds_by_company(company_name):
 
     bonds.sort(key=sort_key, reverse=True)  # ล่าสุดก่อน
 
-    for b in bonds[:15]:
+    target_bonds = bonds[:15]
+
+    def fetch_one(b):
         symbol   = b.get("symbol", "")
         issue_id = b.get("issue_id", "-")
         if not symbol or not token:
-            continue
-        time.sleep(0.3)
+            return b
         detail = get_bond_detail(symbol, issue_id, token, session)
         for k, v in detail.items():
             if k not in b or b[k] == "-":
                 b[k] = v
+        return b
+
+    # ดึงข้อมูล bond แบบ parallel (max 5 threads พร้อมกัน)
+    MAX_WORKERS = min(5, len(target_bonds))
+    if MAX_WORKERS > 0:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(fetch_one, b): b for b in target_bonds}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.warning(f"[parallel] bond fetch error: {e}")
 
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
@@ -513,7 +527,12 @@ def format_bond_message(bonds, company_name):
     # เพิ่มข้อมูล SEC offering ถ้ามี
     try:
         from sec_scraper import search_sec_offerings, format_sec_section
-        offerings = search_sec_offerings(company_name)
+        # SEC fetch ทำ parallel กับ bond format (เริ่ม thread ก่อนแล้วค่อย join)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            sec_future = ex.submit(search_sec_offerings, company_name)
+            # ระหว่างนี้ format bond ไปก่อน
+            # (sec_future จะ resolve เมื่อต้องการ)
+        offerings = sec_future.result(timeout=30)
         sec_text  = format_sec_section(offerings)
         if sec_text:
             lines.extend(["", sec_text])
