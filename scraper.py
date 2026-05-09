@@ -17,16 +17,15 @@ BASE_THAIBMA = "https://www.thaibma.or.th"
 REGISSUE_URL = f"{BASE_THAIBMA}/issuer/regissue"
 ISSUER_URL   = f"{BASE_THAIBMA}/EN/Issuer/IssuerDetail.aspx"
 
-# Service paths จาก Network tab จริงๆ
 GRPC_BOND_SVC   = "bond-grpc/bond.BondGrpcService"
 GRPC_SEARCH_SVC = "bondsearch-grpc/BondSearchGrpc.Models.BondSearchGrpcService"
 
-# Field 3 fixed bytes จาก browser payload (unknown purpose — ส่งไปด้วยเสมอ)
 FIELD3_BYTES = bytes.fromhex("2590adf8cf06")
 
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
+    "X-User-Agent": "grpc-web-javascript/0.1",
 }
 
 # ─── gRPC helpers ─────────────────────────────────────────────────────────────
@@ -125,7 +124,7 @@ def _dump_all(data, path="", depth=0):
                 out.extend(_dump_all(val, p, depth+1))
     return out
 
-# ─── Login ────────────────────────────────────────────────────────────────────
+# ─── Login (gets cookie too) ──────────────────────────────────────────────────
 
 _cached_token = None
 
@@ -135,6 +134,13 @@ def get_bearer_token(session):
         return _cached_token
     if not THAIBMA_USERNAME or not THAIBMA_PASSWORD:
         return None
+
+    # Visit home page first to get cookies
+    try:
+        session.get(f"{BASE_IBOND}/login", headers={**HEADERS_BASE, "Accept": "text/html"}, timeout=10)
+    except Exception:
+        pass
+
     proto   = _proto_string(1, THAIBMA_USERNAME) + _proto_string(2, THAIBMA_PASSWORD)
     payload = _grpc_encode(proto)
     headers = {
@@ -150,6 +156,7 @@ def get_bearer_token(session):
             f"{BASE_IBOND}/grpc/authen-grpc/authen.AuthenGrpcService/Authenticate",
             data=payload, headers=headers, timeout=20,
         )
+        logger.info(f"[login] status={resp.status_code}, cookies={dict(session.cookies)}")
         frames = _grpc_decode_all(resp.text)
         for frame in frames:
             for fnum, wtype, val in _parse_proto(frame):
@@ -174,31 +181,34 @@ def grpc_call(svc, method, proto_bytes, token, session, referer=None):
         "X-Grpc-Web":    "1",
         "Authorization": f"Bearer {token}",
         "Origin":        BASE_IBOND,
-        "Referer":       referer or f"{BASE_IBOND}/bondsearch/bondsearchpage",
+        "Referer":       referer or f"{BASE_IBOND}/bonds",
     }
+    url = f"{BASE_IBOND}/grpc/{svc}/{method}"
     try:
-        resp = session.post(
-            f"{BASE_IBOND}/grpc/{svc}/{method}",
-            data=payload, headers=headers, timeout=30,
-        )
-        logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}")
+        resp = session.post(url, data=payload, headers=headers, timeout=30)
+        logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}, ct={resp.headers.get('Content-Type','')}")
         if resp.status_code != 200:
+            logger.info(f"[grpc] {method} body: {resp.text[:100]}")
+            return []
+        if len(resp.text) == 0:
             return []
         return _grpc_decode_all(resp.text)
     except Exception as e:
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── GetBySymbol (bond detail) ────────────────────────────────────────────────
+# ─── GetBySymbol ──────────────────────────────────────────────────────────────
 
 def get_coupon(symbol, token, session):
-    """
-    เรียก bond-grpc/bond.BondGrpcService/GetBySymbol
-    ด้วย payload เดียวกับที่ browser ส่ง:
-      field 2 = symbol string
-      field 3 = fixed bytes 2590adf8cf06
-    """
-    ref   = f"{BASE_IBOND}/bonds?symbol={symbol}"
+    ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
+
+    # Visit the bond page first to get any cookies/state the server needs
+    try:
+        session.get(ref, headers={**HEADERS_BASE, "Accept": "text/html", "Referer": BASE_IBOND}, timeout=10)
+        logger.info(f"[bond_page] visited, cookies={list(session.cookies.keys())}")
+    except Exception as e:
+        logger.warning(f"[bond_page] {e}")
+
     proto = _proto_string(2, symbol) + _proto_bytes(3, FIELD3_BYTES)
     frames = grpc_call(GRPC_BOND_SVC, "GetBySymbol", proto, token, session, referer=ref)
     logger.info(f"[GetBySymbol] {symbol}: {len(frames)} frames")
@@ -211,20 +221,27 @@ def get_coupon(symbol, token, session):
             logger.info(f"[GetBySymbol] coupon: {c}")
             return c
 
+    # ลองไม่ส่ง field 3
+    proto2 = _proto_string(2, symbol)
+    frames2 = grpc_call(GRPC_BOND_SVC, "GetBySymbol", proto2, token, session, referer=ref)
+    logger.info(f"[GetBySymbol no-f3] {symbol}: {len(frames2)} frames")
+    for frame in frames2:
+        vals = _dump_all(frame)
+        logger.info(f"[GetBySymbol no-f3] vals: {str(vals)[:500]}")
+        c = _find_coupon(vals)
+        if c != "-":
+            return c
+
     return "-"
 
 
 def _find_coupon(vals):
-    """หา coupon rate จาก dump values"""
-    # หา decimal number ระหว่าง 0.5-30 ที่ไม่ใช่ integer
     for path, val in vals:
         if isinstance(val, (int, float)):
             n = float(val)
-            if 0.5 <= n <= 30 and round(n, 4) != round(n):
+            if 0.5 <= n <= 30 and n % 1 != 0:
                 if n < 1: n *= 100
                 return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-
-    # หา pattern X.X% ใน strings
     for path, val in vals:
         if isinstance(val, str):
             m = re.search(r"\b(\d+\.\d+)\s*%", val)
@@ -232,15 +249,6 @@ def _find_coupon(vals):
                 n = float(m.group(1))
                 if 0.5 <= n <= 30:
                     return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-
-    # หา float ที่มี decimal ไม่ใช่ .0
-    for path, val in vals:
-        if isinstance(val, (int, float)):
-            n = float(val)
-            if 0.5 <= n <= 30 and n % 1 != 0:
-                if n < 1: n *= 100
-                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-
     return "-"
 
 
@@ -269,8 +277,9 @@ def get_participants(symbol, issue_uuid, role, token, session):
                                 if ss and len(ss) > 3 and ss not in names:
                                     names.append(ss)
         if names:
-            logger.info(f"[participant] {role}: {' / '.join(names)[:80]}")
-            return " / ".join(names)
+            result = " / ".join(names)
+            logger.info(f"[participant] {role}: {result[:80]}")
+            return result
     return "-"
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
