@@ -154,7 +154,7 @@ SECURITIES_ABBR = {
     "GLOBLEX": "GLBL",
     "SEAMICO": "ZMICO",
     "ZMICO": "ZMICO",
-    "BLUEBELL": "BBS",
+    "BLUEBELL": "BLUE",
     "KIATNAKIN PHATRA": "KKP",
     "KIATNAKIN": "KKP",
     "PHATRA SECURITIES": "PHATRA",
@@ -183,13 +183,24 @@ def abbr_company(name):
 
 
 def clean_participant(val):
-    """ตัดเบอร์โทรออก แล้วแปลงเป็นชื่อย่อ"""
+    """
+    ตัดเบอร์โทรออก แล้วแปลงเป็นชื่อย่อ
+    รองรับหลายบริษัทที่คั่นด้วย | เช่น 'BLUEBELL...|KRUNGTHAI...'
+    """
     if not val or val == "-":
         return val
-    # ตัดเบอร์โทร (ส่วนหลัง ":")
-    if ":" in val:
-        val = val.split(":")[0].strip()
-    return abbr_company(val.strip())
+    # แยกหลายบริษัทด้วย | ก่อน
+    companies = [c.strip() for c in val.split("|") if c.strip()]
+    results = []
+    for company in companies:
+        # ตัดเบอร์โทร (ส่วนหลัง ":")
+        # ระวัง: เบอร์โทรมีรูปแบบ "02-xxx" ส่วน "CO., LTD." ไม่มี ":"
+        # ตัด ":XXXXXXXXX" ที่เป็นตัวเลขหรือเครื่องหมายออก
+        clean = re.sub(r':[\d\-\s]+$', '', company).strip()
+        abbr = abbr_company(clean)
+        if abbr and abbr not in results:
+            results.append(abbr)
+    return " / ".join(results) if results else val
 
 
 def abbr_participants(names_str):
