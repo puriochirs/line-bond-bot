@@ -516,15 +516,12 @@ def search_bonds_by_company(company_name):
             except Exception as e:
                 logger.warning(f"[parallel] bond fetch error: {e}")
 
-    # เก็บ sec_future ไว้ใช้ใน format_bond_message
-    bonds._sec_future = sec_future if sec_future else None
-
     logger.info(f"[main] Done: {len(bonds)} bonds")
-    return bonds
+    return bonds, sec_future
 
 # ─── FORMAT ───────────────────────────────────────────────────────────────────
 
-def format_bond_message(bonds, company_name):
+def format_bond_message(bonds, company_name, sec_future=None):
     if not bonds:
         return (
             f"❌ ไม่พบข้อมูลหุ้นกู้ของ \"{company_name}\"\n\n"
@@ -559,12 +556,11 @@ def format_bond_message(bonds, company_name):
 
     add_bonds(long_bonds,  "📌 Long Term Debenture")
     add_bonds(short_bonds, "📌 Short Term Debenture")
-    # เพิ่มข้อมูล SEC offering — ใช้ future ที่ fetch ไว้แล้วตอน search_bonds
+    # เพิ่มข้อมูล SEC offering
     try:
         from sec_scraper import format_sec_section
-        sec_future = getattr(bonds, "_sec_future", None)
         if sec_future:
-            offerings = sec_future.result(timeout=5)  # รอ max 5 วิ (น่าจะเสร็จแล้ว)
+            offerings = sec_future.result(timeout=5)
         else:
             offerings = []
         sec_text = format_sec_section(offerings)
