@@ -204,22 +204,22 @@ def abbr_company(name):
 def clean_participant(val):
     """
     ตัดเบอร์โทรออก แล้วแปลงเป็นชื่อย่อ
-    รองรับหลายบริษัทที่คั่นด้วย | เช่น 'BLUEBELL...|KRUNGTHAI...'
+    รองรับหลายบริษัทที่คั่นด้วย | เช่น 'BLUEBELL...:02-xxx|KRUNGTHAI...:02-xxx'
     """
     if not val or val == "-":
         return val
-    # แยกหลายบริษัทด้วย | ก่อน
     companies = [c.strip() for c in val.split("|") if c.strip()]
     results = []
     for company in companies:
-        # ตัดเบอร์โทร (ส่วนหลัง ":")
-        # ระวัง: เบอร์โทรมีรูปแบบ "02-xxx" ส่วน "CO., LTD." ไม่มี ":"
-        # ตัด ":XXXXXXXXX" ที่เป็นตัวเลขหรือเครื่องหมายออก
-        clean = re.sub(r':[\d\-\s]+$', '', company).strip()
+        # ตัดเบอร์โทรและข้อมูลหลัง ":" ออกทั้งหมด
+        # pattern: ชื่อบริษัท + ":" + เบอร์/ตัวเลข/เครื่องหมาย
+        clean = re.sub(r':[0-9 \-,./()]+.*$', '', company).strip()
+        # ตัด trailing punctuation
+        clean = clean.rstrip('.,- 	')
         abbr = abbr_company(clean)
         if abbr and abbr not in results:
             results.append(abbr)
-    return " / ".join(results) if results else val
+    return " / ".join(results) if results else "-"
 
 
 def abbr_participants(names_str):
