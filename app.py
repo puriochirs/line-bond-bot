@@ -17,7 +17,7 @@ LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_REPLY_URL            = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL             = "https://api.line.me/v2/bot/message/push"
-LINE_MAX_CHARS            = 4900   # safe limit per message
+LINE_MAX_CHARS            = 3500   # safe limit per message
 LINE_MAX_MSGS             = 5      # LINE allows max 5 per reply
 
 HELP_TEXT = (
