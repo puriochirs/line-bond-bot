@@ -5,6 +5,7 @@ import requests
 import logging
 import re
 import time
+from bs4 import BeautifulSoup
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -137,68 +138,116 @@ def get_bearer_token(session):
         logger.exception(f"[login] error: {e}")
     return None
 
-# ─── Try feature API on www.thaibma.or.th with JWT token ─────────────────────
 
-def get_coupon_from_feature_api(issue_id, symbol, token, session):
-    """
-    ลอง feature API บน www.thaibma.or.th ด้วย JWT token จาก ibond
-    """
-    if not issue_id or issue_id == "-":
-        return "-"
+# ─── Fetch ibond bond page ────────────────────────────────────────────────────
 
-    ref = f"{BASE_THAIBMA}/EN/BondInfo/BondFeature/Issue.aspx"
+def get_coupon_from_ibond_page(symbol, token, session):
+    """
+    เข้าหน้า ibond.thaibma.or.th/bonds?symbol=PCLV268A
+    แล้ว parse coupon rate ออกจากหน้า HTML หรือ JSON response
+    """
+    url = f"{BASE_IBOND}/bonds?symbol={symbol}"
     headers = {
         **HEADERS_BASE,
-        "Accept": "application/json, */*",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*",
         "Authorization": f"Bearer {token}",
-        "Referer": ref,
-        "Origin": BASE_THAIBMA,
+        "Referer": f"{BASE_IBOND}/bondsearch/bondsearchpage",
     }
 
-    # ลอง URLs ต่างๆ
-    urls = [
-        f"{BASE_THAIBMA}/issue/feature?Symbol={issue_id}",
-        f"{BASE_THAIBMA}/issue/feature?Symbol={issue_id.upper()}",
-        f"{BASE_THAIBMA}/issue/couponpaymentreference?Symbol={symbol}",
-        f"{BASE_THAIBMA}/issue/couponpaymentreference?Symbol={symbol.upper()}",
-    ]
+    try:
+        resp = session.get(url, headers=headers, timeout=20)
+        logger.info(f"[ibond_page] {url}: status={resp.status_code}, len={len(resp.text)}, ct={resp.headers.get('Content-Type','')}")
+        logger.info(f"[ibond_page] response preview: {resp.text[:500]}")
 
-    for url in urls:
-        try:
-            r = session.get(url, headers=headers, timeout=15)
-            logger.info(f"[feature_api] {url}: status={r.status_code}, len={len(r.text)}, ct={r.headers.get('Content-Type','')}")
-            if r.status_code == 200 and len(r.text) > 5:
-                logger.info(f"[feature_api] response: {r.text[:200]}")
-                try:
-                    data = r.json()
-                    coupon = _extract_coupon_from_json(data)
-                    if coupon != "-":
-                        logger.info(f"[feature_api] coupon found: {coupon}")
-                        return coupon
-                except Exception:
-                    # ลอง parse raw text
-                    m = re.search(r"Fixed\s*:?\s*([\d.]+)", r.text, re.I)
+        if resp.status_code != 200:
+            return "-"
+
+        ct = resp.headers.get("Content-Type", "")
+
+        # JSON response
+        if "json" in ct:
+            try:
+                data = resp.json()
+                logger.info(f"[ibond_page] json keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
+                coupon = _extract_coupon_from_json(data)
+                if coupon != "-":
+                    return coupon
+            except Exception:
+                pass
+
+        # HTML response — parse ด้วย BeautifulSoup
+        if "html" in ct or resp.text.strip().startswith("<"):
+            soup = BeautifulSoup(resp.text, "lxml")
+            full_text = soup.get_text(separator=" ")
+            logger.info(f"[ibond_page] page text preview: {full_text[:300]}")
+
+            # หา coupon rate pattern ในข้อความ
+            patterns = [
+                r"Coupon\s*(?:Rate|Payment)?[:\s]+(\d+\.?\d*)\s*%",
+                r"Fixed\s*:?\s*(\d+\.?\d*)\s*%?",
+                r"(\d+\.?\d*)\s*%\s*(?:per\s*annum|p\.a\.)",
+                r"อัตราดอกเบี้ย[:\s]+(\d+\.?\d*)",
+            ]
+            for pat in patterns:
+                m = re.search(pat, full_text, re.I)
+                if m:
+                    n = float(m.group(1))
+                    if 0.1 <= n <= 50:
+                        if n < 1: n *= 100
+                        result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                        logger.info(f"[ibond_page] coupon found: {result}")
+                        return result
+
+            # หา JSON ที่ embed ใน script tag
+            for script in soup.find_all("script"):
+                js = script.get_text()
+                if "coupon" in js.lower() or "interest" in js.lower():
+                    m = re.search(r'"(?:coupon|interest|rate)[Rr]ate"\s*:\s*"?([\d.]+)"?', js, re.I)
                     if m:
                         n = float(m.group(1))
-                        if n < 1: n *= 100
-                        return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-        except Exception as e:
-            logger.warning(f"[feature_api] {url}: {e}")
+                        if 0.1 <= n <= 50:
+                            if n < 1: n *= 100
+                            result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                            logger.info(f"[ibond_page] coupon from script: {result}")
+                            return result
+
+        # ลอง API endpoint อื่นๆ ของ ibond
+        api_urls = [
+            f"{BASE_IBOND}/api/bonds/{symbol}",
+            f"{BASE_IBOND}/api/bond?symbol={symbol}",
+            f"{BASE_IBOND}/bonddetail?symbol={symbol}",
+        ]
+        for api_url in api_urls:
+            try:
+                r = session.get(api_url, headers=headers, timeout=10)
+                logger.info(f"[ibond_api] {api_url}: status={r.status_code}, len={len(r.text)}")
+                if r.status_code == 200 and len(r.text) > 10:
+                    logger.info(f"[ibond_api] response: {r.text[:200]}")
+                    try:
+                        data = r.json()
+                        coupon = _extract_coupon_from_json(data)
+                        if coupon != "-":
+                            return coupon
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.exception(f"[ibond_page] error: {e}")
 
     return "-"
 
 
 def _extract_coupon_from_json(data):
-    """Extract coupon rate from JSON response"""
     if not data:
         return "-"
     items = data if isinstance(data, list) else [data]
     for item in items:
         if not isinstance(item, dict):
             continue
-        logger.info(f"[coupon_json] keys: {list(item.keys())[:10]}, vals: {str(dict(list(item.items())[:5]))[:100]}")
-        for key in ["CouponRate", "couponRate", "Rate", "rate", "Value", "value",
-                    "Reference", "reference", "CouponPaymentReference"]:
+        for key in ["couponRate", "CouponRate", "rate", "Rate", "interestRate",
+                    "InterestRate", "fixedRate", "FixedRate", "coupon", "Coupon"]:
             val = item.get(key)
             if val is None or str(val).strip() in ["", "null", "None", "0", "0.0", "-"]:
                 continue
@@ -337,7 +386,6 @@ def _item_to_bond(item, term_type):
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
     return {
         "symbol":           symbol,
-        "issue_id":         g("IssueID", "issueId"),
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
         "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
@@ -370,14 +418,12 @@ def search_bonds_by_company(company_name):
         return []
 
     for b in bonds[:15]:
-        symbol   = b.get("symbol", "")
-        issue_id = b.get("issue_id", "-")
+        symbol = b.get("symbol", "")
         if not symbol or not token:
             continue
 
-        # ลอง feature API บน www.thaibma.or.th ด้วย JWT token
         time.sleep(0.3)
-        coupon = get_coupon_from_feature_api(issue_id, symbol, token, session)
+        coupon = get_coupon_from_ibond_page(symbol, token, session)
         if coupon != "-":
             b["coupon_rate"] = coupon
 
