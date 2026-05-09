@@ -20,11 +20,10 @@ REGISSUE_URL  = f"{BASE_URL}/issuer/regissue"
 BOND_INFO_URL = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
 ISSUER_DETAIL = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
 
-# คำที่ไม่ควรอยู่ใน UWs (garbage values จาก API)
-UW_BLACKLIST = ["financial advisor", "remark", "note", "หมายเหตุ", "-"]
+UW_BLACKLIST = ["financial advisor", "remark", "note", "หมายเหตุ"]
 
 
-def fmt_date(raw: str) -> str:
+def fmt_date(raw):
     if not raw or raw in ["-", "null", "None"]:
         return "-"
     raw = raw.split("T")[0].strip()
@@ -36,7 +35,7 @@ def fmt_date(raw: str) -> str:
     return raw
 
 
-def fmt_number(raw: str) -> str:
+def fmt_number(raw):
     if not raw or raw == "-":
         return "-"
     try:
@@ -48,17 +47,37 @@ def fmt_number(raw: str) -> str:
         return raw
 
 
-def is_valid_uw(val: str) -> bool:
-    """ตรวจสอบว่า val เป็น underwriter จริงๆ ไม่ใช่ garbage"""
-    if not val or val == "-":
+def parse_coupon(coupon_section):
+    text = re.sub(r"<[^>]+>", " ", coupon_section)
+    text = re.sub(r"\s+", " ", text).strip()
+    logger.info(f"[coupon] text: {text[:150]}")
+    m = re.search(r"Fixed\s*:?\s*([\d]+\.?[\d]*)", text, re.I)
+    if m:
+        val = float(m.group(1))
+        if val < 1:
+            val = val * 100
+        return f"{val:.4f}".rstrip("0").rstrip(".") + "%"
+    m2 = re.search(r"\b(FRN)\b|Floating\s*Rate|(TBR|MLR|MOR)\s*[+\-]\s*[\d.]+", text, re.I)
+    if m2:
+        return m2.group(0).strip()
+    nums = re.findall(r"\b(\d+\.\d+)\b", text)
+    for n_str in nums:
+        n = float(n_str)
+        if 0.001 <= n <= 50:
+            if n < 1:
+                n = n * 100
+            return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+    logger.info(f"[coupon] not found")
+    return "-"
+
+
+def is_valid_uw(val):
+    if not val or val in ["-", ""]:
         return False
-    v_lower = val.lower()
-    return not any(b in v_lower for b in UW_BLACKLIST)
+    return not any(b in val.lower() for b in UW_BLACKLIST)
 
 
-# ─── STEP 1: Bond List from JSON API ─────────────────────────────────────────
-
-def fetch_bond_list(abbr_name: str, session: requests.Session) -> list:
+def fetch_bond_list(abbr_name, session):
     all_bonds = []
     ref = f"{ISSUER_DETAIL}?issuer={abbr_name.lower()}"
     for term in ["long", "short"]:
@@ -84,7 +103,7 @@ def fetch_bond_list(abbr_name: str, session: requests.Session) -> list:
     return all_bonds
 
 
-def _item_to_bond(item: dict, term_type: str):
+def _item_to_bond(item, term_type):
     if not isinstance(item, dict):
         return None
 
@@ -103,7 +122,6 @@ def _item_to_bond(item: dict, term_type: str):
     secure_code = g("SecureCode", "securedType", "SecuredType")
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
 
-    # UWs จาก API — กรองก่อน ถ้า garbage ให้เป็น "-" แล้วจะดึงจาก detail page
     api_uw = g("Underwriter", "underwriter")
     uw_value = api_uw if is_valid_uw(api_uw) else "-"
 
@@ -134,9 +152,7 @@ def _item_to_bond(item: dict, term_type: str):
     return bond
 
 
-# ─── STEP 2: Bond Detail ─────────────────────────────────────────────────────
-
-def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
+def fetch_bond_detail(detail_url, session):
     detail = {}
     if not detail_url:
         return detail
@@ -147,37 +163,22 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
         raw_html = resp.text
         soup = BeautifulSoup(raw_html, "lxml")
 
-        # ── 1. Coupon Rate ───────────────────────────────────────────────────
-        # ดึง section หลัง "Coupon Payment" เท่านั้น เพื่อป้องกันการ match ผิด
         coupon_idx = raw_html.lower().find("coupon payment")
         if coupon_idx >= 0:
-            # หา "Fixed: X.X%" ในส่วนหลัง "Coupon Payment" (400 chars)
-            coupon_section = raw_html[coupon_idx: coupon_idx + 400]
-            m = re.search(r"Fixed\s*:?\s*([\d]+\.?[\d]*)\s*%", coupon_section, re.I)
-            if m:
-                detail["coupon_rate"] = m.group(1) + "%"
-                logger.info(f"[detail] coupon fixed: {detail['coupon_rate']}")
-            else:
-                # FRN / Floating
-                m2 = re.search(r"\b(FRN)\b|(Floating\s*Rate)|(TBR|MLR|MOR)\s*[+\-]\s*[\d.]+", coupon_section, re.I)
-                if m2:
-                    detail["coupon_rate"] = m2.group(0).strip()
-                    logger.info(f"[detail] coupon FRN: {detail['coupon_rate']}")
-                else:
-                    logger.info(f"[detail] coupon not found. section: {coupon_section[:100]}")
+            coupon_section = raw_html[coupon_idx: coupon_idx + 600]
+            coupon = parse_coupon(coupon_section)
+            if coupon != "-":
+                detail["coupon_rate"] = coupon
         else:
-            logger.info(f"[detail] 'Coupon Payment' not found in HTML")
+            logger.info(f"[detail] Coupon Payment not found")
 
-        # ── 2. Underwriter ───────────────────────────────────────────────────
         for table in soup.find_all("table"):
             found = False
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
                 if not cells:
                     continue
-                first_lower = cells[0].get_text(strip=True).lower()
-                if "underwriter" in first_lower:
-                    # เอาแค่ cell[1] = value จริงๆ
+                if "underwriter" in cells[0].get_text(strip=True).lower():
                     if len(cells) >= 2:
                         uw_val = cells[1].get_text(strip=True)
                         if is_valid_uw(uw_val):
@@ -188,10 +189,9 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
             if found:
                 break
 
-        # ── 3. Secured Label ─────────────────────────────────────────────────
         if "[ Senior ][ Unsecured ]" in raw_html:
             detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
-        elif "[ Senior ][ Secured ]" in raw_html or "[ Secured ]" in raw_html:
+        elif "[ Secured ]" in raw_html:
             detail["secured_label"] = "🔒 มีหลักประกัน"
 
     except Exception as e:
@@ -199,9 +199,7 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
     return detail
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-
-def search_bonds_by_company(company_name: str) -> list:
+def search_bonds_by_company(company_name):
     session = requests.Session()
     abbr = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
@@ -222,9 +220,7 @@ def search_bonds_by_company(company_name: str) -> list:
     return results
 
 
-# ─── FORMAT ───────────────────────────────────────────────────────────────────
-
-def format_bond_message(bonds: list, company_name: str) -> str:
+def format_bond_message(bonds, company_name):
     if not bonds:
         return (
             f"❌ ไม่พบข้อมูลหุ้นกู้ของ \"{company_name}\"\n\n"
