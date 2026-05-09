@@ -38,6 +38,10 @@ def _proto_string(field_num, value):
     tag = (field_num << 3) | 2
     return bytes([tag]) + _encode_varint(len(b)) + b
 
+def _proto_varint(field_num, value):
+    tag = (field_num << 3) | 0
+    return bytes([tag]) + _encode_varint(int(value))
+
 def _grpc_encode(proto_bytes):
     header = struct.pack(">BI", 0, len(proto_bytes))
     return base64.b64encode(header + proto_bytes).decode("ascii")
@@ -58,12 +62,7 @@ def _grpc_decode_all(b64_text):
         i += length
     return frames
 
-def _parse_proto(data, depth=0):
-    """
-    Recursively parse protobuf bytes.
-    Returns list of (field_num, wire_type, value) tuples.
-    value is bytes for wire_type=2 (length-delimited)
-    """
+def _parse_proto(data):
     results = []
     i = 0
     while i < len(data):
@@ -71,163 +70,38 @@ def _parse_proto(data, depth=0):
             tag_byte  = data[i]; i += 1
             field_num = tag_byte >> 3
             wire_type = tag_byte & 0x07
-
-            if wire_type == 0:  # varint
+            if wire_type == 0:
                 val = 0; shift = 0
                 while True:
                     b = data[i]; i += 1
-                    val |= (b & 0x7f) << shift
-                    shift += 7
+                    val |= (b & 0x7f) << shift; shift += 7
                     if not (b & 0x80): break
                 results.append((field_num, 0, val))
-
-            elif wire_type == 1:  # 64-bit
+            elif wire_type == 1:
                 val = struct.unpack_from("<d", data, i)[0]; i += 8
                 results.append((field_num, 1, val))
-
-            elif wire_type == 2:  # length-delimited
+            elif wire_type == 2:
                 length = 0; shift = 0
                 while True:
                     b = data[i]; i += 1
-                    length |= (b & 0x7f) << shift
-                    shift  += 7
+                    length |= (b & 0x7f) << shift; shift += 7
                     if not (b & 0x80): break
                 val_bytes = data[i:i+length]; i += length
                 results.append((field_num, 2, val_bytes))
-
-            elif wire_type == 5:  # 32-bit
+            elif wire_type == 5:
                 val = struct.unpack_from("<f", data, i)[0]; i += 4
                 results.append((field_num, 5, val))
-
             else:
                 break
         except Exception:
             break
     return results
 
-
-def _find_numbers(data, path=""):
-    """Recursively find all numeric values in protobuf, log everything"""
-    fields = _parse_proto(data)
-    numbers = []
-    for fnum, wtype, val in fields:
-        cur_path = f"{path}.{fnum}"
-
-        if wtype in (0, 1, 5):
-            n = float(val)
-            logger.info(f"[proto] {cur_path} (numeric) = {n}")
-            if 0.01 <= n <= 100:
-                numbers.append((cur_path, n))
-
-        elif wtype == 2:
-            # ลอง decode เป็น string
-            try:
-                s = val.decode("utf-8")
-                logger.info(f"[proto] {cur_path} (string) = {s[:60]!r}")
-                # ลองหาตัวเลขใน string
-                m = re.search(r"\b(\d+\.?\d*)\b", s)
-                if m:
-                    n = float(m.group(1))
-                    if 0.01 <= n <= 100:
-                        numbers.append((cur_path + "(str)", n))
-            except UnicodeDecodeError:
-                logger.info(f"[proto] {cur_path} (bytes) len={len(val)}")
-
-            # ลอง parse เป็น nested proto ถ้า length > 2
-            if len(val) > 2:
-                sub = _find_numbers(val, cur_path)
-                numbers.extend(sub)
-
-    return numbers
-
-
-def get_coupon(symbol, token, session):
-    proto  = _proto_string(1, symbol)
-    frames = grpc_call("GetCouponPayment", proto, token, session)
-
-    logger.info(f"[coupon] {symbol}: {len(frames)} frames")
-
-    best_rate = None
-
-    for fi, frame in enumerate(frames):
-        logger.info(f"[coupon] frame {fi} raw hex: {frame[:60].hex()}")
-        numbers = _find_numbers(frame, f"f{fi}")
-
-        for path, n in numbers:
-            logger.info(f"[coupon] candidate {path} = {n}")
-            # coupon rate น่าจะอยู่ระหว่าง 0.1 ถึง 30
-            if 0.1 <= n <= 30:
-                # ถ้าเป็น decimal เช่น 0.075 → 7.5%
-                if n < 1:
-                    n = n * 100
-                # เลือก rate ที่ใหญ่สุดที่เหมาะสม (ไม่ใช่ปีหรือ count)
-                if best_rate is None or abs(n - 7) < abs(best_rate - 7):
-                    best_rate = n
-
-    if best_rate is not None:
-        result = f"{best_rate:.4f}".rstrip("0").rstrip(".") + "%"
-        logger.info(f"[coupon] final rate: {result}")
-        return result
-
-    logger.info(f"[coupon] no rate found for {symbol}")
-    return "-"
-
-
-def get_participants(symbol, role, token, session):
-    proto  = _proto_string(1, symbol) + _proto_string(2, role)
-    frames = grpc_call("GetParticipants", proto, token, session)
-    names  = []
-    for frame in frames:
-        fields = _parse_proto(frame)
-        logger.info(f"[participant] {role} raw hex: {frame[:40].hex()}")
-        for fnum, wtype, val in fields:
-            if wtype == 2:
-                try:
-                    s = val.decode("utf-8").strip()
-                    if len(s) > 3 and s not in names:
-                        logger.info(f"[participant] {role} field {fnum}: {s[:60]!r}")
-                        names.append(s)
-                except UnicodeDecodeError:
-                    # nested message
-                    sub_fields = _parse_proto(val)
-                    for sf, sw, sv in sub_fields:
-                        if sw == 2:
-                            try:
-                                ss = sv.decode("utf-8").strip()
-                                if len(ss) > 3 and ss not in names:
-                                    logger.info(f"[participant] {role} nested field {sf}: {ss[:60]!r}")
-                                    names.append(ss)
-                            except UnicodeDecodeError:
-                                pass
-    return " / ".join(names) if names else "-"
-
-
-# ─── gRPC call ────────────────────────────────────────────────────────────────
-
-def grpc_call(method, proto_bytes, token, session):
-    payload = _grpc_encode(proto_bytes)
-    headers = {
-        **HEADERS_BASE,
-        "Accept":        "application/grpc-web-text",
-        "Content-Type":  "application/grpc-web-text",
-        "X-Grpc-Web":    "1",
-        "Authorization": f"Bearer {token}",
-        "Origin":        BASE_IBOND,
-        "Referer":       f"{BASE_IBOND}/bondsearch/bondsearchpage",
-    }
+def _decode_str(b):
     try:
-        resp = session.post(
-            f"{BASE_IBOND}/grpc/{GRPC_SVC}/{method}",
-            data=payload, headers=headers, timeout=20,
-        )
-        logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}")
-        if resp.status_code != 200:
-            return []
-        return _grpc_decode_all(resp.text)
-    except Exception as e:
-        logger.warning(f"[grpc] {method}: {e}")
-        return []
-
+        return b.decode("utf-8")
+    except Exception:
+        return None
 
 # ─── Login ────────────────────────────────────────────────────────────────────
 
@@ -256,20 +130,186 @@ def get_bearer_token(session):
         )
         frames = _grpc_decode_all(resp.text)
         for frame in frames:
-            fields = _parse_proto(frame)
-            for fnum, wtype, val in fields:
+            for fnum, wtype, val in _parse_proto(frame):
                 if wtype == 2:
-                    try:
-                        s = val.decode("utf-8")
-                        if len(s) > 30 and "." in s:
-                            _cached_token = s
-                            logger.info(f"[login] token ok: {s[:30]}...")
-                            return s
-                    except UnicodeDecodeError:
-                        pass
+                    s = _decode_str(val)
+                    if s and len(s) > 30 and "." in s:
+                        _cached_token = s
+                        logger.info(f"[login] token ok: {s[:30]}...")
+                        return s
     except Exception as e:
         logger.exception(f"[login] error: {e}")
     return None
+
+# ─── gRPC call ────────────────────────────────────────────────────────────────
+
+def grpc_call(method, proto_bytes, token, session):
+    payload = _grpc_encode(proto_bytes)
+    headers = {
+        **HEADERS_BASE,
+        "Accept":        "application/grpc-web-text",
+        "Content-Type":  "application/grpc-web-text",
+        "X-Grpc-Web":    "1",
+        "Authorization": f"Bearer {token}",
+        "Origin":        BASE_IBOND,
+        "Referer":       f"{BASE_IBOND}/bondsearch/bondsearchpage",
+    }
+    try:
+        resp = session.post(
+            f"{BASE_IBOND}/grpc/{GRPC_SVC}/{method}",
+            data=payload, headers=headers, timeout=30,
+        )
+        logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}")
+        if resp.status_code != 200:
+            return []
+        return _grpc_decode_all(resp.text)
+    except Exception as e:
+        logger.warning(f"[grpc] {method}: {e}")
+        return []
+
+# ─── GetSearchResult ─────────────────────────────────────────────────────────
+
+def search_bond_detail(symbol, token, session):
+    """
+    เรียก GetSearchResult ด้วย symbol filter
+    แล้ว parse ข้อมูลหุ้นกู้แต่ละตัวออกมา
+    """
+    # Build search request proto
+    # Field 1 = symbol search text
+    # อาจมี pagination fields อื่นๆ ด้วย
+    proto = _proto_string(1, symbol)  # search by symbol
+    frames = grpc_call("GetSearchResult", proto, token, session)
+
+    logger.info(f"[search_result] {symbol}: {len(frames)} frames")
+
+    results = []
+    for fi, frame in enumerate(frames):
+        logger.info(f"[search_result] frame {fi} len={len(frame)}, hex={frame[:40].hex()}")
+        # Parse top-level: list of bond records
+        for fnum, wtype, val in _parse_proto(frame):
+            if wtype == 2:
+                # Each field 1 entry = one bond record
+                s = _decode_str(val)
+                if s:
+                    logger.info(f"[search_result] f{fnum} str: {s[:80]!r}")
+                else:
+                    # nested proto = bond record
+                    bond_data = _extract_bond_from_search(val, symbol)
+                    if bond_data:
+                        results.append(bond_data)
+                        logger.info(f"[search_result] found bond: {bond_data}")
+
+    return results
+
+
+def _extract_bond_from_search(data, target_symbol):
+    """Parse one bond record from GetSearchResult"""
+    fields = _parse_proto(data)
+    record = {}
+    for fnum, wtype, val in fields:
+        if wtype == 2:
+            s = _decode_str(val)
+            if s:
+                record[fnum] = s
+            else:
+                # nested
+                sub = {}
+                for sf, sw, sv in _parse_proto(val):
+                    if sw == 2:
+                        ss = _decode_str(sv)
+                        if ss:
+                            sub[sf] = ss
+                    elif sw in (0, 1, 5):
+                        sub[sf] = float(sv)
+                if sub:
+                    record[f"nested_{fnum}"] = sub
+        elif wtype in (0, 1, 5):
+            record[fnum] = float(val)
+
+    logger.info(f"[bond_record] {record}")
+
+    # ตรวจว่าเป็น bond ที่เราต้องการ
+    sym_val = next((v for k, v in record.items() if isinstance(v, str) and target_symbol in v.upper()), None)
+    if not sym_val and target_symbol not in str(record):
+        return None
+
+    return record
+
+
+# ─── Parse coupon from search result ──────────────────────────────────────────
+
+def get_coupon_from_search(symbol, token, session):
+    """ลอง GetSearchResult เพื่อดึง coupon rate"""
+    frames = grpc_call("GetSearchResult", _proto_string(1, symbol), token, session)
+    logger.info(f"[coupon_search] {symbol}: {len(frames)} frames")
+
+    for frame in frames:
+        # dump all strings และ numbers ทั้งหมดออกมา
+        all_data = _dump_all(frame, "")
+        logger.info(f"[coupon_search] all_data: {str(all_data)[:500]}")
+
+        # หา pattern ที่น่าจะเป็น coupon rate (เช่น 7.5)
+        for path, val in all_data:
+            if isinstance(val, (int, float)):
+                n = float(val)
+                # coupon rate 0.5% - 30% น่าจะอยู่ช่วงนี้
+                if 0.5 <= n <= 30:
+                    logger.info(f"[coupon_search] rate candidate {path}={n}")
+            elif isinstance(val, str):
+                m = re.search(r"\b(\d+\.?\d*)\b", val)
+                if m:
+                    try:
+                        n = float(m.group(1))
+                        if 0.5 <= n <= 30:
+                            logger.info(f"[coupon_search] str candidate {path}={n} from {val[:30]!r}")
+                    except Exception:
+                        pass
+    return "-"
+
+
+def _dump_all(data, path, depth=0):
+    """Dump all values recursively"""
+    if depth > 5:
+        return []
+    results = []
+    try:
+        fields = _parse_proto(data)
+        for fnum, wtype, val in fields:
+            cur = f"{path}.{fnum}"
+            if wtype in (0, 1, 5):
+                results.append((cur, float(val)))
+            elif wtype == 2:
+                s = _decode_str(val)
+                if s:
+                    results.append((cur, s))
+                if len(val) > 2:
+                    results.extend(_dump_all(val, cur, depth+1))
+    except Exception:
+        pass
+    return results
+
+
+# ─── Participants ─────────────────────────────────────────────────────────────
+
+def get_participants(symbol, role, token, session):
+    proto  = _proto_string(1, symbol) + _proto_string(2, role)
+    frames = grpc_call("GetParticipants", proto, token, session)
+    names  = []
+    for frame in frames:
+        for fnum, wtype, val in _parse_proto(frame):
+            if wtype == 2:
+                s = _decode_str(val)
+                if s and len(s) > 3 and s not in names:
+                    names.append(s)
+                elif not s:
+                    for sf, sw, sv in _parse_proto(val):
+                        if sw == 2:
+                            ss = _decode_str(sv)
+                            if ss and len(ss) > 3 and ss not in names:
+                                names.append(ss)
+    result = " / ".join(names) if names else "-"
+    logger.info(f"[participant] {role}: {result[:80]}")
+    return result
 
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
@@ -369,17 +409,18 @@ def search_bonds_by_company(company_name):
     logger.info(f"[main] === Searching: '{abbr}' ===")
     token = get_bearer_token(session)
     logger.info(f"[main] token: {bool(token)}")
+
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
+
     for b in bonds[:15]:
         symbol = b.get("symbol", "")
         if not symbol or not token:
             continue
         time.sleep(0.3)
-        coupon = get_coupon(symbol, token, session)
-        if coupon != "-":
-            b["coupon_rate"] = coupon
+        # ลอง GetSearchResult เพื่อดู structure
+        get_coupon_from_search(symbol, token, session)
         time.sleep(0.2)
         uw = get_participants(symbol, "UDW", token, session)
         if uw != "-":
@@ -388,6 +429,7 @@ def search_bonds_by_company(company_name):
         rept = get_participants(symbol, "REPT", token, session)
         if rept != "-":
             b["bondholder_rep"] = rept
+
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
 
