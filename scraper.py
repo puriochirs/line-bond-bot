@@ -1,26 +1,21 @@
 import requests
-from bs4 import BeautifulSoup
 import logging
 import re
 import time
-import json
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
+    "Accept": "application/json, */*",
     "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
-    "Referer": "https://www.thaibma.or.th/EN/Issuer/IssuerDetail.aspx",
 }
 
-BASE_URL      = "https://www.thaibma.or.th"
-REGISSUE_URL  = f"{BASE_URL}/issuer/regissue"
-BOND_INFO_URL = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
-ISSUER_DETAIL = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
-
-UW_BLACKLIST = ["financial advisor", "remark", "note", "หมายเหตุ"]
+BASE         = "https://www.thaibma.or.th"
+REGISSUE_URL = f"{BASE}/issuer/regissue"
+BONDINFO_URL = f"{BASE}/bondinfo"
+ISSUER_URL   = f"{BASE}/EN/Issuer/IssuerDetail.aspx"
 
 
 def fmt_date(raw):
@@ -40,65 +35,92 @@ def fmt_number(raw):
         return "-"
     try:
         n = float(raw)
-        if n == int(n):
-            return f"{int(n):,}"
-        return f"{n:,.2f}"
+        return f"{int(n):,}" if n == int(n) else f"{n:,.2f}"
     except Exception:
         return raw
 
 
-def parse_coupon(coupon_section):
-    text = re.sub(r"<[^>]+>", " ", coupon_section)
-    text = re.sub(r"\s+", " ", text).strip()
-    logger.info(f"[coupon] text: {text[:150]}")
-    m = re.search(r"Fixed\s*:?\s*([\d]+\.?[\d]*)", text, re.I)
-    if m:
-        val = float(m.group(1))
-        if val < 1:
-            val = val * 100
-        return f"{val:.4f}".rstrip("0").rstrip(".") + "%"
-    m2 = re.search(r"\b(FRN)\b|Floating\s*Rate|(TBR|MLR|MOR)\s*[+\-]\s*[\d.]+", text, re.I)
-    if m2:
-        return m2.group(0).strip()
-    nums = re.findall(r"\b(\d+\.\d+)\b", text)
-    for n_str in nums:
-        n = float(n_str)
-        if 0.001 <= n <= 50:
-            if n < 1:
-                n = n * 100
-            return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-    logger.info(f"[coupon] not found")
+def api_get(url, session, ref=None):
+    try:
+        r = session.get(url, headers={**HEADERS, "Referer": ref or BASE}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning(f"[api_get] {url}: {e}")
+        return None
+
+
+def parse_participant(data, role):
+    if not data:
+        return "-"
+    names = []
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ["InstitutionName", "Name", "name", "institutionName"]:
+            n = item.get(key, "")
+            if n and str(n).strip():
+                names.append(str(n).strip())
+                break
+    result = " / ".join(names) if names else "-"
+    logger.info(f"[participant] {role}: {result[:80]}")
+    return result
+
+
+def parse_coupon(data):
+    if not data:
+        return "-"
+    logger.info(f"[coupon] raw data: {str(data)[:200]}")
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ["CouponRate", "couponRate", "Rate", "rate", "Value", "value",
+                    "Reference", "reference", "CouponValue", "couponValue"]:
+            val = item.get(key)
+            if val is None or str(val).strip() in ["", "null", "None", "-"]:
+                continue
+            v = str(val).strip()
+            # Fixed: 7.5 หรือ Fixed:0.075
+            m = re.search(r"Fixed\s*:?\s*([\d.]+)", v, re.I)
+            if m:
+                n = float(m.group(1))
+                if n < 1: n *= 100
+                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+            # ตัวเลขล้วน
+            try:
+                n = float(v)
+                if 0 < n <= 50:
+                    if n < 1: n *= 100
+                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+            except ValueError:
+                pass
+            # FRN
+            if any(k in v.upper() for k in ["FRN", "FLOAT", "MLR", "MOR", "TBR"]):
+                return v[:40]
     return "-"
-
-
-def is_valid_uw(val):
-    if not val or val in ["-", ""]:
-        return False
-    return not any(b in val.lower() for b in UW_BLACKLIST)
 
 
 def fetch_bond_list(abbr_name, session):
     all_bonds = []
-    ref = f"{ISSUER_DETAIL}?issuer={abbr_name.lower()}"
+    ref = f"{ISSUER_URL}?issuer={abbr_name.lower()}"
     for term in ["long", "short"]:
         url = f"{REGISSUE_URL}?abbrName={abbr_name}&term={term}"
-        try:
-            resp = session.get(url, headers={**HEADERS, "Referer": ref}, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            items = data if isinstance(data, list) else []
-            if isinstance(data, dict):
-                for key in ["data", "result", "bonds", "items", "records", "value"]:
-                    if key in data and isinstance(data[key], list):
-                        items = data[key]
-                        break
-            for item in items:
-                bond = _item_to_bond(item, term)
-                if bond:
-                    all_bonds.append(bond)
-            logger.info(f"[api] {term}: {len(items)} items")
-        except Exception as e:
-            logger.exception(f"[api] {term}: {e}")
+        data = api_get(url, session, ref)
+        if not data:
+            continue
+        items = data if isinstance(data, list) else []
+        if isinstance(data, dict):
+            for key in ["data", "result", "bonds", "items", "records", "value"]:
+                if key in data and isinstance(data[key], list):
+                    items = data[key]
+                    break
+        for item in items:
+            bond = _item_to_bond(item, term)
+            if bond:
+                all_bonds.append(bond)
+        logger.info(f"[api] {term}: {len(items)} items")
     logger.info(f"[api] Total: {len(all_bonds)} bonds")
     return all_bonds
 
@@ -122,80 +144,58 @@ def _item_to_bond(item, term_type):
     secure_code = g("SecureCode", "securedType", "SecuredType")
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
 
-    api_uw = g("Underwriter", "underwriter")
-    uw_value = api_uw if is_valid_uw(api_uw) else "-"
-
-    bond = {
+    return {
         "symbol":           symbol,
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
-        "issue_date":       fmt_date(g("IssuedDate", "IssueDate", "issueDate")),
+        "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
         "tenor":            g("Term", "term", "tenor"),
         "coupon_rate":      "-",
         "issue_size":       fmt_number(g("IssueSize", "issueSize")),
-        "outstanding_size": fmt_number(g("CurrentOutstanding", "IssueOutstanding", "outstanding")),
+        "outstanding_size": fmt_number(g("CurrentOutstanding", "IssueOutstanding")),
         "secured_type":     secure_code,
         "secured_label":    secured_label,
         "registrar":        g("Registrar", "registrar"),
-        "bondholder_rep":   g("BondholderRepresentative", "bondholderRep"),
-        "underwriters":     uw_value,
+        "bondholder_rep":   g("BondholderRepresentative"),
+        "underwriters":     "-",
         "issue_rating":     g("IssueRating", "issueRating"),
         "issuer_rating":    g("CompanyRating", "issuerRating"),
         "distribution":     g("DistributionDisplay", "distribution"),
-        "isin":             g("IssueLegacyID", "isinCode", "ISIN"),
+        "isin":             g("IssueLegacyID", "isinCode"),
     }
 
-    issue_id = g("IssueID", "issueId", "id", "Id")
-    if issue_id != "-":
-        bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
 
-    return bond
-
-
-def fetch_bond_detail(detail_url, session):
+def fetch_bond_apis(symbol, session):
     detail = {}
-    if not detail_url:
-        return detail
-    try:
-        logger.info(f"[detail] GET {detail_url}")
-        resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
-        resp.raise_for_status()
-        raw_html = resp.text
-        soup = BeautifulSoup(raw_html, "lxml")
+    ref = f"{BASE}/EN/BondInfo/BondFeature/Issue.aspx"
 
-        coupon_idx = raw_html.lower().find("coupon payment")
-        if coupon_idx >= 0:
-            coupon_section = raw_html[coupon_idx: coupon_idx + 600]
-            coupon = parse_coupon(coupon_section)
-            if coupon != "-":
-                detail["coupon_rate"] = coupon
-        else:
-            logger.info(f"[detail] Coupon Payment not found")
+    # Coupon
+    coupon_data = api_get(f"{BONDINFO_URL}/couponpaymentreference?Symbol={symbol}", session, ref)
+    coupon = parse_coupon(coupon_data)
+    if coupon != "-":
+        detail["coupon_rate"] = coupon
+    time.sleep(0.2)
 
-        for table in soup.find_all("table"):
-            found = False
-            for row in table.find_all("tr"):
-                cells = row.find_all(["td", "th"])
-                if not cells:
-                    continue
-                if "underwriter" in cells[0].get_text(strip=True).lower():
-                    if len(cells) >= 2:
-                        uw_val = cells[1].get_text(strip=True)
-                        if is_valid_uw(uw_val):
-                            detail["underwriters"] = uw_val
-                            logger.info(f"[detail] UW: {uw_val[:60]}")
-                    found = True
-                    break
-            if found:
-                break
+    # Underwriter
+    uw_data = api_get(f"{BONDINFO_URL}/participant?Symbol={symbol}&InstitutionRole=UDW", session, ref)
+    uw = parse_participant(uw_data, "UDW")
+    if uw != "-":
+        detail["underwriters"] = uw
+    time.sleep(0.2)
 
-        if "[ Senior ][ Unsecured ]" in raw_html:
-            detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
-        elif "[ Secured ]" in raw_html:
-            detail["secured_label"] = "🔒 มีหลักประกัน"
+    # BH Rep
+    rept_data = api_get(f"{BONDINFO_URL}/participant?Symbol={symbol}&InstitutionRole=REPT", session, ref)
+    rept = parse_participant(rept_data, "REPT")
+    if rept != "-":
+        detail["bondholder_rep"] = rept
+    time.sleep(0.2)
 
-    except Exception as e:
-        logger.exception(f"[detail] error: {e}")
+    # Registrar
+    regt_data = api_get(f"{BONDINFO_URL}/participant?Symbol={symbol}&InstitutionRole=REGT", session, ref)
+    regt = parse_participant(regt_data, "REGT")
+    if regt != "-":
+        detail["registrar"] = regt
+
     return detail
 
 
@@ -208,10 +208,10 @@ def search_bonds_by_company(company_name):
         return []
     results = []
     for b in bonds[:15]:
-        detail_url = b.get("detail_url", "")
-        if detail_url:
-            time.sleep(0.3)
-            detail = fetch_bond_detail(detail_url, session)
+        symbol = b.get("symbol", "")
+        if symbol:
+            time.sleep(0.2)
+            detail = fetch_bond_apis(symbol, session)
             for k, v in detail.items():
                 if k not in b or b[k] == "-":
                     b[k] = v
