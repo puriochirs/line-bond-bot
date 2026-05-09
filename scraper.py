@@ -154,6 +154,10 @@ SECURITIES_ABBR = {
     "GLOBLEX": "GLBL",
     "SEAMICO": "ZMICO",
     "ZMICO": "ZMICO",
+    "BLUEBELL": "BBS",
+    "KIATNAKIN PHATRA": "KKP",
+    "KIATNAKIN": "KKP",
+    "PHATRA SECURITIES": "PHATRA",
     "UOB KAY HIAN": "UOBKH",
     "KRUNGSRI": "KSS",
     "BANGKOK SECURITIES": "BS",
@@ -288,12 +292,14 @@ def get_bond_detail(symbol, issue_uuid, token, session):
         result["coupon_rate"] = coupon
 
     # ── Underwriter (field 11) & BH Rep (field 12) ──
+    # Log all string fields for debugging
     uw_list = []
     bh_list = []
     for fnum, wtype, val in _parse_proto(frame):
         if wtype == 2:
             s = _decode_str(val)
             if s and len(s) > 3:
+                logger.info(f"[field] {fnum} = {s[:80]!r}")
                 if fnum == 11:
                     abbr = clean_participant(s)
                     if abbr and abbr not in uw_list:
