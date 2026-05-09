@@ -38,10 +38,6 @@ def _proto_string(field_num, value):
     tag = (field_num << 3) | 2
     return bytes([tag]) + _encode_varint(len(b)) + b
 
-def _proto_varint(field_num, value):
-    tag = (field_num << 3) | 0
-    return bytes([tag]) + _encode_varint(int(value))
-
 def _grpc_encode(proto_bytes):
     header = struct.pack(">BI", 0, len(proto_bytes))
     return base64.b64encode(header + proto_bytes).decode("ascii")
@@ -141,6 +137,87 @@ def get_bearer_token(session):
         logger.exception(f"[login] error: {e}")
     return None
 
+# ─── Try feature API on www.thaibma.or.th with JWT token ─────────────────────
+
+def get_coupon_from_feature_api(issue_id, symbol, token, session):
+    """
+    ลอง feature API บน www.thaibma.or.th ด้วย JWT token จาก ibond
+    """
+    if not issue_id or issue_id == "-":
+        return "-"
+
+    ref = f"{BASE_THAIBMA}/EN/BondInfo/BondFeature/Issue.aspx"
+    headers = {
+        **HEADERS_BASE,
+        "Accept": "application/json, */*",
+        "Authorization": f"Bearer {token}",
+        "Referer": ref,
+        "Origin": BASE_THAIBMA,
+    }
+
+    # ลอง URLs ต่างๆ
+    urls = [
+        f"{BASE_THAIBMA}/issue/feature?Symbol={issue_id}",
+        f"{BASE_THAIBMA}/issue/feature?Symbol={issue_id.upper()}",
+        f"{BASE_THAIBMA}/issue/couponpaymentreference?Symbol={symbol}",
+        f"{BASE_THAIBMA}/issue/couponpaymentreference?Symbol={symbol.upper()}",
+    ]
+
+    for url in urls:
+        try:
+            r = session.get(url, headers=headers, timeout=15)
+            logger.info(f"[feature_api] {url}: status={r.status_code}, len={len(r.text)}, ct={r.headers.get('Content-Type','')}")
+            if r.status_code == 200 and len(r.text) > 5:
+                logger.info(f"[feature_api] response: {r.text[:200]}")
+                try:
+                    data = r.json()
+                    coupon = _extract_coupon_from_json(data)
+                    if coupon != "-":
+                        logger.info(f"[feature_api] coupon found: {coupon}")
+                        return coupon
+                except Exception:
+                    # ลอง parse raw text
+                    m = re.search(r"Fixed\s*:?\s*([\d.]+)", r.text, re.I)
+                    if m:
+                        n = float(m.group(1))
+                        if n < 1: n *= 100
+                        return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+        except Exception as e:
+            logger.warning(f"[feature_api] {url}: {e}")
+
+    return "-"
+
+
+def _extract_coupon_from_json(data):
+    """Extract coupon rate from JSON response"""
+    if not data:
+        return "-"
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        logger.info(f"[coupon_json] keys: {list(item.keys())[:10]}, vals: {str(dict(list(item.items())[:5]))[:100]}")
+        for key in ["CouponRate", "couponRate", "Rate", "rate", "Value", "value",
+                    "Reference", "reference", "CouponPaymentReference"]:
+            val = item.get(key)
+            if val is None or str(val).strip() in ["", "null", "None", "0", "0.0", "-"]:
+                continue
+            v = str(val).strip()
+            m = re.search(r"Fixed\s*:?\s*([\d.]+)", v, re.I)
+            if m:
+                n = float(m.group(1))
+                if n < 1: n *= 100
+                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+            try:
+                n = float(v)
+                if 0.1 <= n <= 50:
+                    if n < 1: n *= 100
+                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+            except ValueError:
+                pass
+    return "-"
+
+
 # ─── gRPC call ────────────────────────────────────────────────────────────────
 
 def grpc_call(method, proto_bytes, token, session):
@@ -167,129 +244,6 @@ def grpc_call(method, proto_bytes, token, session):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── GetSearchResult ─────────────────────────────────────────────────────────
-
-def search_bond_detail(symbol, token, session):
-    """
-    เรียก GetSearchResult ด้วย symbol filter
-    แล้ว parse ข้อมูลหุ้นกู้แต่ละตัวออกมา
-    """
-    # Build search request proto
-    # Field 1 = symbol search text
-    # อาจมี pagination fields อื่นๆ ด้วย
-    proto = _proto_string(1, symbol)  # search by symbol
-    frames = grpc_call("GetSearchResult", proto, token, session)
-
-    logger.info(f"[search_result] {symbol}: {len(frames)} frames")
-
-    results = []
-    for fi, frame in enumerate(frames):
-        logger.info(f"[search_result] frame {fi} len={len(frame)}, hex={frame[:40].hex()}")
-        # Parse top-level: list of bond records
-        for fnum, wtype, val in _parse_proto(frame):
-            if wtype == 2:
-                # Each field 1 entry = one bond record
-                s = _decode_str(val)
-                if s:
-                    logger.info(f"[search_result] f{fnum} str: {s[:80]!r}")
-                else:
-                    # nested proto = bond record
-                    bond_data = _extract_bond_from_search(val, symbol)
-                    if bond_data:
-                        results.append(bond_data)
-                        logger.info(f"[search_result] found bond: {bond_data}")
-
-    return results
-
-
-def _extract_bond_from_search(data, target_symbol):
-    """Parse one bond record from GetSearchResult"""
-    fields = _parse_proto(data)
-    record = {}
-    for fnum, wtype, val in fields:
-        if wtype == 2:
-            s = _decode_str(val)
-            if s:
-                record[fnum] = s
-            else:
-                # nested
-                sub = {}
-                for sf, sw, sv in _parse_proto(val):
-                    if sw == 2:
-                        ss = _decode_str(sv)
-                        if ss:
-                            sub[sf] = ss
-                    elif sw in (0, 1, 5):
-                        sub[sf] = float(sv)
-                if sub:
-                    record[f"nested_{fnum}"] = sub
-        elif wtype in (0, 1, 5):
-            record[fnum] = float(val)
-
-    logger.info(f"[bond_record] {record}")
-
-    # ตรวจว่าเป็น bond ที่เราต้องการ
-    sym_val = next((v for k, v in record.items() if isinstance(v, str) and target_symbol in v.upper()), None)
-    if not sym_val and target_symbol not in str(record):
-        return None
-
-    return record
-
-
-# ─── Parse coupon from search result ──────────────────────────────────────────
-
-def get_coupon_from_search(symbol, token, session):
-    """ลอง GetSearchResult เพื่อดึง coupon rate"""
-    frames = grpc_call("GetSearchResult", _proto_string(1, symbol), token, session)
-    logger.info(f"[coupon_search] {symbol}: {len(frames)} frames")
-
-    for frame in frames:
-        # dump all strings และ numbers ทั้งหมดออกมา
-        all_data = _dump_all(frame, "")
-        logger.info(f"[coupon_search] all_data: {str(all_data)[:500]}")
-
-        # หา pattern ที่น่าจะเป็น coupon rate (เช่น 7.5)
-        for path, val in all_data:
-            if isinstance(val, (int, float)):
-                n = float(val)
-                # coupon rate 0.5% - 30% น่าจะอยู่ช่วงนี้
-                if 0.5 <= n <= 30:
-                    logger.info(f"[coupon_search] rate candidate {path}={n}")
-            elif isinstance(val, str):
-                m = re.search(r"\b(\d+\.?\d*)\b", val)
-                if m:
-                    try:
-                        n = float(m.group(1))
-                        if 0.5 <= n <= 30:
-                            logger.info(f"[coupon_search] str candidate {path}={n} from {val[:30]!r}")
-                    except Exception:
-                        pass
-    return "-"
-
-
-def _dump_all(data, path, depth=0):
-    """Dump all values recursively"""
-    if depth > 5:
-        return []
-    results = []
-    try:
-        fields = _parse_proto(data)
-        for fnum, wtype, val in fields:
-            cur = f"{path}.{fnum}"
-            if wtype in (0, 1, 5):
-                results.append((cur, float(val)))
-            elif wtype == 2:
-                s = _decode_str(val)
-                if s:
-                    results.append((cur, s))
-                if len(val) > 2:
-                    results.extend(_dump_all(val, cur, depth+1))
-    except Exception:
-        pass
-    return results
-
-
-# ─── Participants ─────────────────────────────────────────────────────────────
 
 def get_participants(symbol, role, token, session):
     proto  = _proto_string(1, symbol) + _proto_string(2, role)
@@ -383,6 +337,7 @@ def _item_to_bond(item, term_type):
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
     return {
         "symbol":           symbol,
+        "issue_id":         g("IssueID", "issueId"),
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
         "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
@@ -415,16 +370,22 @@ def search_bonds_by_company(company_name):
         return []
 
     for b in bonds[:15]:
-        symbol = b.get("symbol", "")
+        symbol   = b.get("symbol", "")
+        issue_id = b.get("issue_id", "-")
         if not symbol or not token:
             continue
+
+        # ลอง feature API บน www.thaibma.or.th ด้วย JWT token
         time.sleep(0.3)
-        # ลอง GetSearchResult เพื่อดู structure
-        get_coupon_from_search(symbol, token, session)
+        coupon = get_coupon_from_feature_api(issue_id, symbol, token, session)
+        if coupon != "-":
+            b["coupon_rate"] = coupon
+
         time.sleep(0.2)
         uw = get_participants(symbol, "UDW", token, session)
         if uw != "-":
             b["underwriters"] = uw
+
         time.sleep(0.2)
         rept = get_participants(symbol, "REPT", token, session)
         if rept != "-":
