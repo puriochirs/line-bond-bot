@@ -112,36 +112,31 @@ def _dump_all(data, path="", depth=0):
             s = _decode_str(val)
             if s:
                 out.append((p, s))
-            # always recurse into bytes regardless of decodability
             if len(val) > 1:
                 out.extend(_dump_all(val, p, depth+1))
     return out
 
-def _find_75_in_frame(frame):
-    """Search for 7.5 as float32, float64, or string in raw frame bytes"""
-    # 7.5 as float32 LE: 00 00 F0 40
+def _search_75(frame):
+    """ค้นหา 7.5 ในทุกรูปแบบ"""
+    found = []
     f32 = struct.pack("<f", 7.5)
-    # 7.5 as float64 LE: 00 00 00 00 00 00 1E 40
     f64 = struct.pack("<d", 7.5)
-    # 7.5 as ASCII
-    s75 = b"7.5"
-
     if f32 in frame:
-        logger.info(f"[search75] found float32 7.5 at offset {frame.index(f32)}")
+        found.append(f"float32@{frame.index(f32)}")
     if f64 in frame:
-        logger.info(f"[search75] found float64 7.5 at offset {frame.index(f64)}")
-    if s75 in frame:
-        logger.info(f"[search75] found string '7.5' at offset {frame.index(s75)}")
-
-    # Also search for any float that rounds to 7.5
-    for i in range(len(frame) - 3):
+        found.append(f"float64@{frame.index(f64)}")
+    if b"7.5" in frame:
+        found.append(f"str@{frame.index(b'7.5')}")
+    # scan all floats
+    for i in range(len(frame)-3):
         v = struct.unpack_from("<f", frame, i)[0]
-        if abs(v - 7.5) < 0.01:
-            logger.info(f"[search75] float32~7.5 at offset {i}: {v}")
-    for i in range(len(frame) - 7):
+        if 7.4 < v < 7.6:
+            found.append(f"float32~7.5@{i}={v:.4f}")
+    for i in range(len(frame)-7):
         v = struct.unpack_from("<d", frame, i)[0]
         if 7.4 < v < 7.6:
-            logger.info(f"[search75] float64~7.5 at offset {i}: {v}")
+            found.append(f"float64~7.5@{i}={v:.4f}")
+    return found
 
 # ─── Login ────────────────────────────────────────────────────────────────────
 
@@ -198,60 +193,65 @@ def grpc_call(svc, method, proto_bytes, token, session, referer=None):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── GetBySymbol ──────────────────────────────────────────────────────────────
+# ─── Get coupon ───────────────────────────────────────────────────────────────
 
-def get_coupon(symbol, token, session):
+def get_coupon(symbol, issue_uuid, token, session):
     ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
     try:
         session.get(ref, headers={**HEADERS_BASE, "Accept": "text/html", "Referer": BASE_IBOND}, timeout=10)
     except Exception:
         pass
 
-    # ส่งแค่ field 2 = symbol (ไม่มี field 3)
-    proto  = _proto_string(2, symbol)
-    frames = grpc_call(GRPC_BOND_SVC, "GetBySymbol", proto, token, session, referer=ref)
-    logger.info(f"[GetBySymbol] {symbol}: {len(frames)} frames")
+    # ลอง methods ต่างๆ ใน bond-grpc service ด้วย symbol และ UUID
+    methods = [
+        ("GetBondFeature",          _proto_string(2, symbol)),
+        ("GetBondFeature",          _proto_string(1, symbol)),
+        ("GetBondFeature",          _proto_string(1, issue_uuid) if issue_uuid != "-" else None),
+        ("GetBondHighlightFeature", _proto_string(2, symbol)),
+        ("GetBondHighlightFeature", _proto_string(1, symbol)),
+        ("GetBondHighlightFeature", _proto_string(1, issue_uuid) if issue_uuid != "-" else None),
+        ("GetBondStatusFeature",    _proto_string(2, symbol)),
+        ("GetBondStatusFeature",    _proto_string(1, symbol)),
+        ("GetCashFlow",             _proto_string(1, symbol)),
+        ("GetCashFlow",             _proto_string(2, symbol)),
+        ("GetXISchedule",           _proto_string(1, symbol)),
+        ("GetXISchedule",           _proto_string(2, symbol)),
+    ]
 
-    for fi, frame in enumerate(frames):
-        logger.info(f"[frame{fi}] len={len(frame)} hex_start={frame[:20].hex()}")
+    for method, proto in methods:
+        if proto is None:
+            continue
+        frames = grpc_call(GRPC_BOND_SVC, method, proto, token, session, referer=ref)
+        logger.info(f"[{method}] {symbol}: {len(frames)} frames")
+        if not frames:
+            continue
 
-        # Search for 7.5 in raw bytes
-        _find_75_in_frame(frame)
+        for frame in frames:
+            hits = _search_75(frame)
+            if hits:
+                logger.info(f"[{method}] 7.5 FOUND: {hits}")
 
-        # Dump ALL values (no truncation)
-        vals = _dump_all(frame)
-        for path, val in vals:
-            logger.info(f"[val] {path} = {repr(val)[:80]}")
+            vals = _dump_all(frame)
+            for path, val in vals:
+                logger.info(f"[{method}] val {path}={repr(val)[:60]}")
 
-        c = _find_coupon(vals, frame)
-        if c != "-":
-            logger.info(f"[coupon] found: {c}")
-            return c
+            c = _extract_coupon(vals, frame)
+            if c != "-":
+                logger.info(f"[{method}] coupon: {c}")
+                return c
 
     return "-"
 
 
-def _find_coupon(vals, raw_frame=None):
-    """หา coupon rate จากทุก approach"""
-    # 1. หา float32/64 ที่เป็น 7.x ใน raw bytes
-    if raw_frame:
-        for i in range(len(raw_frame) - 3):
-            try:
-                v = struct.unpack_from("<f", raw_frame, i)[0]
-                if 0.5 <= v <= 30 and v % 0.25 == 0:  # coupon มักเป็น .25 increments
-                    logger.info(f"[raw_float32] offset={i} val={v}")
-            except Exception:
-                pass
-
-    # 2. หาจาก parsed values
+def _extract_coupon(vals, raw=None):
+    # float 0.5-30 with decimal
     for path, val in vals:
         if isinstance(val, (int, float)):
             n = float(val)
             if 0.5 <= n <= 30 and n % 1 != 0:
                 if n < 1: n *= 100
                 return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-
-    # 3. หา pattern ใน strings
+    # string with X.X%
     for path, val in vals:
         if isinstance(val, str):
             m = re.search(r"\b(\d+\.\d+)\s*%?", val)
@@ -262,7 +262,13 @@ def _find_coupon(vals, raw_frame=None):
                         return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
                 except Exception:
                     pass
-
+    # raw float scan
+    if raw:
+        for i in range(len(raw)-3):
+            v = struct.unpack_from("<f", raw, i)[0]
+            if 0.5 <= v <= 30 and v % 0.01 != 0:
+                if v % 1 != 0:
+                    return f"{v:.4f}".rstrip("0").rstrip(".") + "%"
     return "-"
 
 
@@ -291,9 +297,7 @@ def get_participants(symbol, issue_uuid, role, token, session):
                                 if ss and len(ss) > 3 and ss not in names:
                                     names.append(ss)
         if names:
-            result = " / ".join(names)
-            logger.info(f"[participant] {role}: {result[:80]}")
-            return result
+            return " / ".join(names)
     return "-"
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
@@ -327,8 +331,6 @@ def fmt_number(raw):
         return f"{int(n):,}" if n == int(n) else f"{n:,.2f}"
     except Exception:
         return raw
-
-# ─── Bond List ────────────────────────────────────────────────────────────────
 
 def fetch_bond_list(abbr_name, session):
     all_bonds = []
@@ -385,8 +387,6 @@ def _item_to_bond(item, term_type):
         "isin":             g("IssueLegacyID", "isinCode"),
     }
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-
 def search_bonds_by_company(company_name):
     session = requests.Session()
     abbr    = company_name.strip().upper()
@@ -401,7 +401,7 @@ def search_bonds_by_company(company_name):
         if not symbol or not token:
             continue
         time.sleep(0.3)
-        coupon = get_coupon(symbol, token, session)
+        coupon = get_coupon(symbol, issue_id, token, session)
         if coupon != "-":
             b["coupon_rate"] = coupon
         time.sleep(0.2)
@@ -414,8 +414,6 @@ def search_bonds_by_company(company_name):
             b["bondholder_rep"] = rept
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
-
-# ─── FORMAT ───────────────────────────────────────────────────────────────────
 
 def format_bond_message(bonds, company_name):
     if not bonds:
