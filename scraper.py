@@ -23,7 +23,7 @@ HEADERS_BASE = {
     "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
 }
 
-# ─── gRPC-web helpers ─────────────────────────────────────────────────────────
+# ─── gRPC helpers ─────────────────────────────────────────────────────────────
 
 def _encode_varint(n):
     result = []
@@ -58,16 +58,34 @@ def _grpc_decode_all(b64_text):
         i += length
     return frames
 
-def _proto_extract(data):
-    """Extract all fields from protobuf bytes → dict {field_num: value}"""
-    results = {}
+def _parse_proto(data, depth=0):
+    """
+    Recursively parse protobuf bytes.
+    Returns list of (field_num, wire_type, value) tuples.
+    value is bytes for wire_type=2 (length-delimited)
+    """
+    results = []
     i = 0
     while i < len(data):
         try:
             tag_byte  = data[i]; i += 1
             field_num = tag_byte >> 3
             wire_type = tag_byte & 0x07
-            if wire_type == 2:
+
+            if wire_type == 0:  # varint
+                val = 0; shift = 0
+                while True:
+                    b = data[i]; i += 1
+                    val |= (b & 0x7f) << shift
+                    shift += 7
+                    if not (b & 0x80): break
+                results.append((field_num, 0, val))
+
+            elif wire_type == 1:  # 64-bit
+                val = struct.unpack_from("<d", data, i)[0]; i += 8
+                results.append((field_num, 1, val))
+
+            elif wire_type == 2:  # length-delimited
                 length = 0; shift = 0
                 while True:
                     b = data[i]; i += 1
@@ -75,69 +93,114 @@ def _proto_extract(data):
                     shift  += 7
                     if not (b & 0x80): break
                 val_bytes = data[i:i+length]; i += length
-                try:
-                    results[field_num] = val_bytes.decode("utf-8", errors="replace")
-                except Exception:
-                    results[field_num] = val_bytes.hex()
-            elif wire_type == 0:
-                val = 0; shift = 0
-                while True:
-                    b = data[i]; i += 1
-                    val |= (b & 0x7f) << shift
-                    shift += 7
-                    if not (b & 0x80): break
-                results[field_num] = val
-            elif wire_type == 5:
-                results[field_num] = struct.unpack_from("<f", data, i)[0]; i += 4
-            elif wire_type == 1:
-                results[field_num] = struct.unpack_from("<d", data, i)[0]; i += 8
+                results.append((field_num, 2, val_bytes))
+
+            elif wire_type == 5:  # 32-bit
+                val = struct.unpack_from("<f", data, i)[0]; i += 4
+                results.append((field_num, 5, val))
+
             else:
                 break
         except Exception:
             break
     return results
 
-# ─── Login ────────────────────────────────────────────────────────────────────
 
-_cached_token = None
+def _find_numbers(data, path=""):
+    """Recursively find all numeric values in protobuf, log everything"""
+    fields = _parse_proto(data)
+    numbers = []
+    for fnum, wtype, val in fields:
+        cur_path = f"{path}.{fnum}"
 
-def get_bearer_token(session):
-    global _cached_token
-    if _cached_token:
-        return _cached_token
-    if not THAIBMA_USERNAME or not THAIBMA_PASSWORD:
-        logger.warning("[login] No credentials")
-        return None
+        if wtype in (0, 1, 5):
+            n = float(val)
+            logger.info(f"[proto] {cur_path} (numeric) = {n}")
+            if 0.01 <= n <= 100:
+                numbers.append((cur_path, n))
 
-    proto   = _proto_string(1, THAIBMA_USERNAME) + _proto_string(2, THAIBMA_PASSWORD)
-    payload = _grpc_encode(proto)
-    headers = {
-        **HEADERS_BASE,
-        "Accept":       "application/grpc-web-text",
-        "Content-Type": "application/grpc-web-text",
-        "X-Grpc-Web":   "1",
-        "Origin":       BASE_IBOND,
-        "Referer":      f"{BASE_IBOND}/login",
-    }
-    try:
-        resp = session.post(
-            f"{BASE_IBOND}/grpc/authen-grpc/authen.AuthenGrpcService/Authenticate",
-            data=payload, headers=headers, timeout=20,
-        )
-        logger.info(f"[login] status={resp.status_code}")
-        frames = _grpc_decode_all(resp.text)
-        for frame in frames:
-            fields = _proto_extract(frame)
-            logger.info(f"[login] fields: { {k: str(v)[:40] for k,v in fields.items()} }")
-            for fnum, val in fields.items():
-                if isinstance(val, str) and len(val) > 30 and "." in val:
-                    _cached_token = val
-                    logger.info(f"[login] token ok field={fnum}: {val[:30]}...")
-                    return val
-    except Exception as e:
-        logger.exception(f"[login] error: {e}")
-    logger.warning("[login] no token found")
-    return None
+        elif wtype == 2:
+            # ลอง decode เป็น string
+            try:
+                s = val.decode("utf-8")
+                logger.info(f"[proto] {cur_path} (string) = {s[:60]!r}")
+                # ลองหาตัวเลขใน string
+                m = re.search(r"\b(\d+\.?\d*)\b", s)
+                if m:
+                    n = float(m.group(1))
+                    if 0.01 <= n <= 100:
+                        numbers.append((cur_path + "(str)", n))
+            except UnicodeDecodeError:
+                logger.info(f"[proto] {cur_path} (bytes) len={len(val)}")
+
+            # ลอง parse เป็น nested proto ถ้า length > 2
+            if len(val) > 2:
+                sub = _find_numbers(val, cur_path)
+                numbers.extend(sub)
+
+    return numbers
+
+
+def get_coupon(symbol, token, session):
+    proto  = _proto_string(1, symbol)
+    frames = grpc_call("GetCouponPayment", proto, token, session)
+
+    logger.info(f"[coupon] {symbol}: {len(frames)} frames")
+
+    best_rate = None
+
+    for fi, frame in enumerate(frames):
+        logger.info(f"[coupon] frame {fi} raw hex: {frame[:60].hex()}")
+        numbers = _find_numbers(frame, f"f{fi}")
+
+        for path, n in numbers:
+            logger.info(f"[coupon] candidate {path} = {n}")
+            # coupon rate น่าจะอยู่ระหว่าง 0.1 ถึง 30
+            if 0.1 <= n <= 30:
+                # ถ้าเป็น decimal เช่น 0.075 → 7.5%
+                if n < 1:
+                    n = n * 100
+                # เลือก rate ที่ใหญ่สุดที่เหมาะสม (ไม่ใช่ปีหรือ count)
+                if best_rate is None or abs(n - 7) < abs(best_rate - 7):
+                    best_rate = n
+
+    if best_rate is not None:
+        result = f"{best_rate:.4f}".rstrip("0").rstrip(".") + "%"
+        logger.info(f"[coupon] final rate: {result}")
+        return result
+
+    logger.info(f"[coupon] no rate found for {symbol}")
+    return "-"
+
+
+def get_participants(symbol, role, token, session):
+    proto  = _proto_string(1, symbol) + _proto_string(2, role)
+    frames = grpc_call("GetParticipants", proto, token, session)
+    names  = []
+    for frame in frames:
+        fields = _parse_proto(frame)
+        logger.info(f"[participant] {role} raw hex: {frame[:40].hex()}")
+        for fnum, wtype, val in fields:
+            if wtype == 2:
+                try:
+                    s = val.decode("utf-8").strip()
+                    if len(s) > 3 and s not in names:
+                        logger.info(f"[participant] {role} field {fnum}: {s[:60]!r}")
+                        names.append(s)
+                except UnicodeDecodeError:
+                    # nested message
+                    sub_fields = _parse_proto(val)
+                    for sf, sw, sv in sub_fields:
+                        if sw == 2:
+                            try:
+                                ss = sv.decode("utf-8").strip()
+                                if len(ss) > 3 and ss not in names:
+                                    logger.info(f"[participant] {role} nested field {sf}: {ss[:60]!r}")
+                                    names.append(ss)
+                            except UnicodeDecodeError:
+                                pass
+    return " / ".join(names) if names else "-"
+
 
 # ─── gRPC call ────────────────────────────────────────────────────────────────
 
@@ -165,46 +228,49 @@ def grpc_call(method, proto_bytes, token, session):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── Parse coupon ─────────────────────────────────────────────────────────────
 
-def get_coupon(symbol, token, session):
-    proto  = _proto_string(1, symbol)
-    frames = grpc_call("GetCouponPayment", proto, token, session)
-    for frame in frames:
-        fields = _proto_extract(frame)
-        logger.info(f"[coupon] {symbol} fields: { {k: str(v)[:50] for k,v in fields.items()} }")
-        for fnum, val in fields.items():
-            if isinstance(val, (int, float)):
-                n = float(val)
-                if 0 < n <= 50:
-                    if n < 1: n *= 100
-                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            if isinstance(val, str):
-                m = re.search(r"(\d+\.?\d*)\s*%?", val)
-                if m:
+# ─── Login ────────────────────────────────────────────────────────────────────
+
+_cached_token = None
+
+def get_bearer_token(session):
+    global _cached_token
+    if _cached_token:
+        return _cached_token
+    if not THAIBMA_USERNAME or not THAIBMA_PASSWORD:
+        return None
+    proto   = _proto_string(1, THAIBMA_USERNAME) + _proto_string(2, THAIBMA_PASSWORD)
+    payload = _grpc_encode(proto)
+    headers = {
+        **HEADERS_BASE,
+        "Accept": "application/grpc-web-text",
+        "Content-Type": "application/grpc-web-text",
+        "X-Grpc-Web": "1",
+        "Origin": BASE_IBOND,
+        "Referer": f"{BASE_IBOND}/login",
+    }
+    try:
+        resp = session.post(
+            f"{BASE_IBOND}/grpc/authen-grpc/authen.AuthenGrpcService/Authenticate",
+            data=payload, headers=headers, timeout=20,
+        )
+        frames = _grpc_decode_all(resp.text)
+        for frame in frames:
+            fields = _parse_proto(frame)
+            for fnum, wtype, val in fields:
+                if wtype == 2:
                     try:
-                        n = float(m.group(1))
-                        if 0 < n <= 50:
-                            if n < 1: n *= 100
-                            return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                    except ValueError:
+                        s = val.decode("utf-8")
+                        if len(s) > 30 and "." in s:
+                            _cached_token = s
+                            logger.info(f"[login] token ok: {s[:30]}...")
+                            return s
+                    except UnicodeDecodeError:
                         pass
-    return "-"
+    except Exception as e:
+        logger.exception(f"[login] error: {e}")
+    return None
 
-# ─── Parse participants ───────────────────────────────────────────────────────
-
-def get_participants(symbol, role, token, session):
-    proto  = _proto_string(1, symbol) + _proto_string(2, role)
-    frames = grpc_call("GetParticipants", proto, token, session)
-    names  = []
-    for frame in frames:
-        fields = _proto_extract(frame)
-        logger.info(f"[participant] {role} fields: { {k: str(v)[:50] for k,v in fields.items()} }")
-        for fnum, val in fields.items():
-            if isinstance(val, str) and len(val) > 3:
-                if val not in names and not val.startswith("0x"):
-                    names.append(val)
-    return " / ".join(names) if names else "-"
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
 
@@ -236,6 +302,7 @@ def fmt_number(raw):
         return f"{int(n):,}" if n == int(n) else f"{n:,.2f}"
     except Exception:
         return raw
+
 
 # ─── Bond List ────────────────────────────────────────────────────────────────
 
@@ -293,20 +360,18 @@ def _item_to_bond(item, term_type):
         "isin":             g("IssueLegacyID", "isinCode"),
     }
 
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def search_bonds_by_company(company_name):
     session = requests.Session()
     abbr    = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
-
     token = get_bearer_token(session)
     logger.info(f"[main] token: {bool(token)}")
-
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
-
     for b in bonds[:15]:
         symbol = b.get("symbol", "")
         if not symbol or not token:
@@ -323,9 +388,9 @@ def search_bonds_by_company(company_name):
         rept = get_participants(symbol, "REPT", token, session)
         if rept != "-":
             b["bondholder_rep"] = rept
-
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
+
 
 # ─── FORMAT ───────────────────────────────────────────────────────────────────
 
