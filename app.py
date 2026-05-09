@@ -227,102 +227,83 @@ def health():
 @app.route("/debug-sec/<abbr>", methods=["GET"])
 def debug_sec(abbr):
     """
-    Debug SEC scraper ผ่าน browser โดยไม่ต้อง terminal
+    Debug SEC scraper — แสดง raw API response ทุก step
     ตัวอย่าง: https://line-bond-bot.onrender.com/debug-sec/BANPU
     """
-    import io
-    from sec_scraper import get_unique_id, get_filings_html, parse_debenture_table
-
     lines = []
-    log   = lines.append  # shorthand
+    log   = lines.append
+
+    SEC_BASE    = "https://market.sec.or.th/public/idisc"
+    COMPANY_URL = f"{SEC_BASE}/api/company/valuebyuniqueid"
+    FILING_URL  = f"{SEC_BASE}/api/product/GetViewFiling"
+    SEC_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "th,en;q=0.9",
+        "Content-Type": "application/json",
+        "Referer": "https://market.sec.or.th/public/idisc/th/Product/Filing",
+        "X-Requested-With": "XMLHttpRequest",
+    }
 
     log(f"🔍 DEBUG SEC SCRAPER — ABBR: {abbr.upper()}")
-    log("=" * 50)
+    log("=" * 60)
 
     session = requests.Session()
 
-    # ── STEP 0: warm-up (รับ cookie) ──────────────────
-    log("\n[STEP 0] warm-up GET (รับ cookie)")
+    # ── STEP 0: warm-up ───────────────────────────────────────
+    log("\n[STEP 0] warm-up GET")
     try:
-        r0 = session.get(
-            "https://market.sec.or.th/public/idisc/th/Product/Filing",
-            timeout=10
-        )
-        log(f"  status = {r0.status_code}")
+        r0 = session.get("https://market.sec.or.th/public/idisc/th/Product/Filing", timeout=10)
+        log(f"  status  = {r0.status_code}")
         log(f"  cookies = {dict(session.cookies)}")
     except Exception as e:
-        log(f"  ❌ warm-up error: {e}")
+        log(f"  ❌ error: {e}")
 
-    # ── STEP 1: get_unique_id ──────────────────────────
-    log("\n[STEP 1] get_unique_id")
-    uid = get_unique_id(abbr.upper(), session)
-    log(f"  uid returned = {uid!r}")
-    if not uid:
-        log("  ❌ ไม่ได้ uid → หยุดที่ Step 1")
-        log("\n💡 สาเหตุที่เป็นไปได้:")
-        log("  - ชื่อย่อไม่ตรง (ลอง ABBR ตัวอื่น)")
-        log("  - API block / เปลี่ยน key ใน response")
+    # ── STEP 1: POST valuebyuniqueid — ดู raw response ────────
+    log(f"\n[STEP 1] POST {COMPANY_URL}")
+    log(f"  payload = {{\"lang\": \"th\", \"content\": \"{abbr.upper()}\"}}")
+    try:
+        r1 = session.post(
+            COMPANY_URL,
+            json={"lang": "th", "content": abbr.upper()},
+            headers=SEC_HEADERS,
+            timeout=15,
+        )
+        log(f"  status       = {r1.status_code}")
+        log(f"  content-type = {r1.headers.get('Content-Type', '-')}")
+        log(f"  response len = {len(r1.text)} chars")
+        log(f"\n  ── RAW RESPONSE (ทั้งหมด) ──")
+        log(r1.text[:3000])  # แสดงสูงสุด 3000 ตัวอักษร
+
+        if r1.status_code != 200:
+            log(f"\n  ❌ non-200 → หยุด")
+            return "<pre>" + "\n".join(lines) + "</pre>"
+
+        # พยายาม parse JSON
+        try:
+            data = r1.json()
+            log(f"\n  ── PARSED JSON ──")
+            log(f"  type = {type(data).__name__}")
+            if isinstance(data, list):
+                log(f"  length = {len(data)}")
+                if data:
+                    log(f"  [0] keys = {list(data[0].keys()) if isinstance(data[0], dict) else 'not a dict'}")
+                    log(f"  [0] full = {data[0]}")
+            elif isinstance(data, dict):
+                log(f"  keys = {list(data.keys())}")
+                log(f"  full = {data}")
+            else:
+                log(f"  value = {data}")
+        except Exception as e:
+            log(f"\n  ❌ JSON parse error: {e}")
+            log("  → response ไม่ใช่ JSON จริง")
+
+    except Exception as e:
+        log(f"  ❌ request error: {e}")
         return "<pre>" + "\n".join(lines) + "</pre>"
 
-    # ── STEP 2: get_filings_html (ลองทั้ง raw + padded) ──
-    log("\n[STEP 2] get_filings_html")
-
-    uid_variants = {
-        "raw    ": uid.lstrip("0") or uid,
-        "padded ": uid,
-    }
-
-    html = ""
-    for label, test_uid in uid_variants.items():
-        log(f"\n  ลอง uid ({label}) = {test_uid!r}")
-        # patch uid ชั่วคราวสำหรับ get_filings_html
-        html = get_filings_html(test_uid, session)
-        log(f"  html length = {len(html)}")
-        if html:
-            log(f"  ✅ ได้ HTML จาก uid ({label})")
-            log(f"  preview: {html[:300]!r}")
-            break
-        else:
-            log(f"  ❌ ไม่ได้ HTML")
-
-    if not html:
-        log("\n💡 สาเหตุที่เป็นไปได้:")
-        log("  - UniqueIdReference ผิดรูปแบบ")
-        log("  - SEC API เปลี่ยน payload")
-        log("  - ต้องการ header เพิ่มเติม")
-        return "<pre>" + "\n".join(lines) + "</pre>"
-
-    # ── STEP 3: parse table ────────────────────────────
-    log("\n[STEP 3] parse_debenture_table")
-    from bs4 import BeautifulSoup
-
-    soup       = BeautifulSoup(html, "lxml")
-    all_tables = soup.find_all("table")
-    log(f"  จำนวน table ทั้งหมดใน HTML: {len(all_tables)}")
-    for t in all_tables:
-        log(f"    id={t.get('id')!r}  class={t.get('class')}")
-
-    table = soup.find("table", {"id": "gPP02T03"})
-    if table:
-        rows = table.find_all("tr")
-        log(f"  ✅ พบ table#gPP02T03  rows={len(rows)}")
-        if rows:
-            header_cols = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
-            log(f"  header ({len(header_cols)} cols): {header_cols}")
-        if len(rows) > 1:
-            data_cols = [c.get_text(strip=True) for c in rows[1].find_all("td")]
-            log(f"  row[1] ({len(data_cols)} cols): {data_cols}")
-    else:
-        log("  ❌ ไม่พบ table id=gPP02T03 → column index อาจผิด")
-
-    results = parse_debenture_table(html)
-    log(f"\n[RESULT] offerings ที่ parse ได้: {len(results)} รายการ")
-    for o in results:
-        log(f"  {o}")
-
-    log("\n" + "=" * 50)
-    log("✅ Debug เสร็จแล้ว — copy ผลนี้ส่งมาให้ดูได้เลย")
-
+    log("\n" + "=" * 60)
+    log("📋 copy ผลนี้ส่งมาให้ดูได้เลย จะ fix ให้ทันที")
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
