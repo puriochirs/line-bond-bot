@@ -100,43 +100,42 @@ def _decode_str(b):
     except Exception:
         return None
 
-def _dump_all(data, path="", depth=0):
-    if depth > 6:
-        return []
-    out = []
-    for fnum, wtype, val in _parse_proto(data):
-        p = f"{path}.{fnum}"
-        if wtype in (0, 1, 5):
-            out.append((p, float(val)))
-        elif wtype == 2:
-            s = _decode_str(val)
-            if s:
-                out.append((p, s))
-            if len(val) > 1:
-                out.extend(_dump_all(val, p, depth+1))
-    return out
 
-def _search_75(frame):
-    """ค้นหา 7.5 ในทุกรูปแบบ"""
-    found = []
-    f32 = struct.pack("<f", 7.5)
-    f64 = struct.pack("<d", 7.5)
-    if f32 in frame:
-        found.append(f"float32@{frame.index(f32)}")
-    if f64 in frame:
-        found.append(f"float64@{frame.index(f64)}")
-    if b"7.5" in frame:
-        found.append(f"str@{frame.index(b'7.5')}")
-    # scan all floats
-    for i in range(len(frame)-3):
-        v = struct.unpack_from("<f", frame, i)[0]
-        if 7.4 < v < 7.6:
-            found.append(f"float32~7.5@{i}={v:.4f}")
-    for i in range(len(frame)-7):
-        v = struct.unpack_from("<d", frame, i)[0]
-        if 7.4 < v < 7.6:
-            found.append(f"float64~7.5@{i}={v:.4f}")
-    return found
+def extract_coupon_from_raw(frame):
+    """
+    ค้นหา coupon rate จาก raw frame
+    Key insight: coupon rate เช่น 7.5, 6.5, 5.75 มี <= 2 decimal places
+    ขณะที่ garbage decimals เช่น 4.4766 มี > 2 decimal places → กรองออก
+    """
+    text = frame.decode("latin-1")
+    matches = re.findall(r'\b(\d{1,2}\.\d{1,4})\b', text)
+    logger.info(f"[coupon_raw] all decimals: {matches[:15]}")
+
+    for m in matches:
+        decimal_part = m.split('.')[1]
+        if len(decimal_part) > 2:
+            # มีทศนิยมมากกว่า 2 ตำแหน่ง → ไม่ใช่ coupon rate ปกติ
+            continue
+        try:
+            n = float(m)
+            if 0.1 <= n <= 30:
+                if n < 1: n *= 100
+                result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                logger.info(f"[coupon_raw] found: {m} → {result}")
+                return result
+        except Exception:
+            pass
+    return "-"
+
+
+def clean_participant(val):
+    """ตัดเบอร์โทรออก: 'KRUNGTHAI XSPRING...:02-695-5555' → 'KRUNGTHAI XSPRING...'"""
+    if not val or val == "-":
+        return val
+    if ":" in val:
+        val = val.split(":")[0].strip()
+    return val.strip()
+
 
 # ─── Login ────────────────────────────────────────────────────────────────────
 
@@ -193,112 +192,50 @@ def grpc_call(svc, method, proto_bytes, token, session, referer=None):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── Get coupon ───────────────────────────────────────────────────────────────
+# ─── GetBondFeature ───────────────────────────────────────────────────────────
 
-def get_coupon(symbol, issue_uuid, token, session):
+def get_bond_detail(symbol, issue_uuid, token, session):
+    """
+    GetBondFeature ด้วย IssueID UUID ใน field 1
+    ได้ข้อมูล: coupon (str "7.5" ใน raw), UW (field 11), BH Rep (field 12)
+    """
     ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
     try:
         session.get(ref, headers={**HEADERS_BASE, "Accept": "text/html", "Referer": BASE_IBOND}, timeout=10)
     except Exception:
         pass
 
-    # ลอง methods ต่างๆ ใน bond-grpc service ด้วย symbol และ UUID
-    methods = [
-        ("GetBondFeature",          _proto_string(2, symbol)),
-        ("GetBondFeature",          _proto_string(1, symbol)),
-        ("GetBondFeature",          _proto_string(1, issue_uuid) if issue_uuid != "-" else None),
-        ("GetBondHighlightFeature", _proto_string(2, symbol)),
-        ("GetBondHighlightFeature", _proto_string(1, symbol)),
-        ("GetBondHighlightFeature", _proto_string(1, issue_uuid) if issue_uuid != "-" else None),
-        ("GetBondStatusFeature",    _proto_string(2, symbol)),
-        ("GetBondStatusFeature",    _proto_string(1, symbol)),
-        ("GetCashFlow",             _proto_string(1, symbol)),
-        ("GetCashFlow",             _proto_string(2, symbol)),
-        ("GetXISchedule",           _proto_string(1, symbol)),
-        ("GetXISchedule",           _proto_string(2, symbol)),
-    ]
+    if not issue_uuid or issue_uuid == "-":
+        return {}
 
-    for method, proto in methods:
-        if proto is None:
-            continue
-        frames = grpc_call(GRPC_BOND_SVC, method, proto, token, session, referer=ref)
-        logger.info(f"[{method}] {symbol}: {len(frames)} frames")
-        if not frames:
-            continue
+    proto  = _proto_string(1, issue_uuid)
+    frames = grpc_call(GRPC_BOND_SVC, "GetBondFeature", proto, token, session, referer=ref)
+    logger.info(f"[GetBondFeature] {symbol}: {len(frames)} frames")
+    if not frames:
+        return {}
 
-        for frame in frames:
-            hits = _search_75(frame)
-            if hits:
-                logger.info(f"[{method}] 7.5 FOUND: {hits}")
+    result = {}
+    frame  = frames[0]
 
-            vals = _dump_all(frame)
-            for path, val in vals:
-                logger.info(f"[{method}] val {path}={repr(val)[:60]}")
+    # ── Coupon Rate ──
+    coupon = extract_coupon_from_raw(frame)
+    if coupon != "-":
+        result["coupon_rate"] = coupon
 
-            c = _extract_coupon(vals, frame)
-            if c != "-":
-                logger.info(f"[{method}] coupon: {c}")
-                return c
+    # ── Underwriter (field 11) & BH Rep (field 12) ──
+    for fnum, wtype, val in _parse_proto(frame):
+        if wtype == 2:
+            s = _decode_str(val)
+            if s and len(s) > 3:
+                if fnum == 11:
+                    result["underwriters"] = clean_participant(s)
+                    logger.info(f"[GetBondFeature] UW: {result['underwriters'][:60]}")
+                elif fnum == 12:
+                    result["bondholder_rep"] = clean_participant(s)
+                    logger.info(f"[GetBondFeature] BH Rep: {result['bondholder_rep'][:60]}")
 
-    return "-"
+    return result
 
-
-def _extract_coupon(vals, raw=None):
-    # float 0.5-30 with decimal
-    for path, val in vals:
-        if isinstance(val, (int, float)):
-            n = float(val)
-            if 0.5 <= n <= 30 and n % 1 != 0:
-                if n < 1: n *= 100
-                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-    # string with X.X%
-    for path, val in vals:
-        if isinstance(val, str):
-            m = re.search(r"\b(\d+\.\d+)\s*%?", val)
-            if m:
-                try:
-                    n = float(m.group(1))
-                    if 0.5 <= n <= 30:
-                        return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                except Exception:
-                    pass
-    # raw float scan
-    if raw:
-        for i in range(len(raw)-3):
-            v = struct.unpack_from("<f", raw, i)[0]
-            if 0.5 <= v <= 30 and v % 0.01 != 0:
-                if v % 1 != 0:
-                    return f"{v:.4f}".rstrip("0").rstrip(".") + "%"
-    return "-"
-
-
-# ─── GetParticipants ──────────────────────────────────────────────────────────
-
-def get_participants(symbol, issue_uuid, role, token, session):
-    ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
-    for proto in [
-        _proto_string(1, symbol) + _proto_string(2, role),
-        _proto_string(1, issue_uuid) + _proto_string(2, role) if issue_uuid != "-" else None,
-    ]:
-        if proto is None:
-            continue
-        frames = grpc_call(GRPC_SEARCH_SVC, "GetParticipants", proto, token, session, referer=ref)
-        names = []
-        for frame in frames:
-            for fnum, wtype, val in _parse_proto(frame):
-                if wtype == 2:
-                    s = _decode_str(val)
-                    if s and len(s) > 3 and s not in names:
-                        names.append(s)
-                    elif not s and len(val) > 2:
-                        for sf, sw, sv in _parse_proto(val):
-                            if sw == 2:
-                                ss = _decode_str(sv)
-                                if ss and len(ss) > 3 and ss not in names:
-                                    names.append(ss)
-        if names:
-            return " / ".join(names)
-    return "-"
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
 
@@ -331,6 +268,8 @@ def fmt_number(raw):
         return f"{int(n):,}" if n == int(n) else f"{n:,.2f}"
     except Exception:
         return raw
+
+# ─── Bond List ────────────────────────────────────────────────────────────────
 
 def fetch_bond_list(abbr_name, session):
     all_bonds = []
@@ -387,6 +326,8 @@ def _item_to_bond(item, term_type):
         "isin":             g("IssueLegacyID", "isinCode"),
     }
 
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
 def search_bonds_by_company(company_name):
     session = requests.Session()
     abbr    = company_name.strip().upper()
@@ -395,25 +336,22 @@ def search_bonds_by_company(company_name):
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
+
     for b in bonds[:15]:
         symbol   = b.get("symbol", "")
         issue_id = b.get("issue_id", "-")
         if not symbol or not token:
             continue
         time.sleep(0.3)
-        coupon = get_coupon(symbol, issue_id, token, session)
-        if coupon != "-":
-            b["coupon_rate"] = coupon
-        time.sleep(0.2)
-        uw = get_participants(symbol, issue_id, "UDW", token, session)
-        if uw != "-":
-            b["underwriters"] = uw
-        time.sleep(0.2)
-        rept = get_participants(symbol, issue_id, "REPT", token, session)
-        if rept != "-":
-            b["bondholder_rep"] = rept
+        detail = get_bond_detail(symbol, issue_id, token, session)
+        for k, v in detail.items():
+            if k not in b or b[k] == "-":
+                b[k] = v
+
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
+
+# ─── FORMAT ───────────────────────────────────────────────────────────────────
 
 def format_bond_message(bonds, company_name):
     if not bonds:
