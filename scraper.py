@@ -20,15 +20,11 @@ ISSUER_URL   = f"{BASE_THAIBMA}/EN/Issuer/IssuerDetail.aspx"
 GRPC_BOND_SVC   = "bond-grpc/bond.BondGrpcService"
 GRPC_SEARCH_SVC = "bondsearch-grpc/BondSearchGrpc.Models.BondSearchGrpcService"
 
-FIELD3_BYTES = bytes.fromhex("2590adf8cf06")
-
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "th,en-US;q=0.9,en;q=0.8",
     "X-User-Agent": "grpc-web-javascript/0.1",
 }
-
-# ─── gRPC helpers ─────────────────────────────────────────────────────────────
 
 def _encode_varint(n):
     result = []
@@ -42,10 +38,6 @@ def _proto_string(field_num, value):
     b = value.encode("utf-8") if isinstance(value, str) else value
     tag = (field_num << 3) | 2
     return bytes([tag]) + _encode_varint(len(b)) + b
-
-def _proto_bytes(field_num, data):
-    tag = (field_num << 3) | 2
-    return bytes([tag]) + _encode_varint(len(data)) + data
 
 def _grpc_encode(proto_bytes):
     header = struct.pack(">BI", 0, len(proto_bytes))
@@ -109,7 +101,7 @@ def _decode_str(b):
         return None
 
 def _dump_all(data, path="", depth=0):
-    if depth > 5:
+    if depth > 6:
         return []
     out = []
     for fnum, wtype, val in _parse_proto(data):
@@ -120,11 +112,38 @@ def _dump_all(data, path="", depth=0):
             s = _decode_str(val)
             if s:
                 out.append((p, s))
-            if len(val) > 2:
+            # always recurse into bytes regardless of decodability
+            if len(val) > 1:
                 out.extend(_dump_all(val, p, depth+1))
     return out
 
-# ─── Login (gets cookie too) ──────────────────────────────────────────────────
+def _find_75_in_frame(frame):
+    """Search for 7.5 as float32, float64, or string in raw frame bytes"""
+    # 7.5 as float32 LE: 00 00 F0 40
+    f32 = struct.pack("<f", 7.5)
+    # 7.5 as float64 LE: 00 00 00 00 00 00 1E 40
+    f64 = struct.pack("<d", 7.5)
+    # 7.5 as ASCII
+    s75 = b"7.5"
+
+    if f32 in frame:
+        logger.info(f"[search75] found float32 7.5 at offset {frame.index(f32)}")
+    if f64 in frame:
+        logger.info(f"[search75] found float64 7.5 at offset {frame.index(f64)}")
+    if s75 in frame:
+        logger.info(f"[search75] found string '7.5' at offset {frame.index(s75)}")
+
+    # Also search for any float that rounds to 7.5
+    for i in range(len(frame) - 3):
+        v = struct.unpack_from("<f", frame, i)[0]
+        if abs(v - 7.5) < 0.01:
+            logger.info(f"[search75] float32~7.5 at offset {i}: {v}")
+    for i in range(len(frame) - 7):
+        v = struct.unpack_from("<d", frame, i)[0]
+        if 7.4 < v < 7.6:
+            logger.info(f"[search75] float64~7.5 at offset {i}: {v}")
+
+# ─── Login ────────────────────────────────────────────────────────────────────
 
 _cached_token = None
 
@@ -134,29 +153,19 @@ def get_bearer_token(session):
         return _cached_token
     if not THAIBMA_USERNAME or not THAIBMA_PASSWORD:
         return None
-
-    # Visit home page first to get cookies
     try:
         session.get(f"{BASE_IBOND}/login", headers={**HEADERS_BASE, "Accept": "text/html"}, timeout=10)
     except Exception:
         pass
-
     proto   = _proto_string(1, THAIBMA_USERNAME) + _proto_string(2, THAIBMA_PASSWORD)
     payload = _grpc_encode(proto)
-    headers = {
-        **HEADERS_BASE,
-        "Accept": "application/grpc-web-text",
-        "Content-Type": "application/grpc-web-text",
-        "X-Grpc-Web": "1",
-        "Origin": BASE_IBOND,
-        "Referer": f"{BASE_IBOND}/login",
-    }
+    headers = {**HEADERS_BASE, "Accept": "application/grpc-web-text",
+               "Content-Type": "application/grpc-web-text", "X-Grpc-Web": "1",
+               "Origin": BASE_IBOND, "Referer": f"{BASE_IBOND}/login"}
     try:
         resp = session.post(
             f"{BASE_IBOND}/grpc/authen-grpc/authen.AuthenGrpcService/Authenticate",
-            data=payload, headers=headers, timeout=20,
-        )
-        logger.info(f"[login] status={resp.status_code}, cookies={dict(session.cookies)}")
+            data=payload, headers=headers, timeout=20)
         frames = _grpc_decode_all(resp.text)
         for frame in frames:
             for fnum, wtype, val in _parse_proto(frame):
@@ -174,23 +183,15 @@ def get_bearer_token(session):
 
 def grpc_call(svc, method, proto_bytes, token, session, referer=None):
     payload = _grpc_encode(proto_bytes)
-    headers = {
-        **HEADERS_BASE,
-        "Accept":        "application/grpc-web-text",
-        "Content-Type":  "application/grpc-web-text",
-        "X-Grpc-Web":    "1",
-        "Authorization": f"Bearer {token}",
-        "Origin":        BASE_IBOND,
-        "Referer":       referer or f"{BASE_IBOND}/bonds",
-    }
-    url = f"{BASE_IBOND}/grpc/{svc}/{method}"
+    headers = {**HEADERS_BASE, "Accept": "application/grpc-web-text",
+               "Content-Type": "application/grpc-web-text", "X-Grpc-Web": "1",
+               "Authorization": f"Bearer {token}", "Origin": BASE_IBOND,
+               "Referer": referer or f"{BASE_IBOND}/bonds"}
     try:
-        resp = session.post(url, data=payload, headers=headers, timeout=30)
-        logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}, ct={resp.headers.get('Content-Type','')}")
-        if resp.status_code != 200:
-            logger.info(f"[grpc] {method} body: {resp.text[:100]}")
-            return []
-        if len(resp.text) == 0:
+        resp = session.post(f"{BASE_IBOND}/grpc/{svc}/{method}",
+                            data=payload, headers=headers, timeout=30)
+        logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}")
+        if resp.status_code != 200 or not resp.text:
             return []
         return _grpc_decode_all(resp.text)
     except Exception as e:
@@ -201,54 +202,67 @@ def grpc_call(svc, method, proto_bytes, token, session, referer=None):
 
 def get_coupon(symbol, token, session):
     ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
-
-    # Visit the bond page first to get any cookies/state the server needs
     try:
         session.get(ref, headers={**HEADERS_BASE, "Accept": "text/html", "Referer": BASE_IBOND}, timeout=10)
-        logger.info(f"[bond_page] visited, cookies={list(session.cookies.keys())}")
-    except Exception as e:
-        logger.warning(f"[bond_page] {e}")
+    except Exception:
+        pass
 
-    proto = _proto_string(2, symbol) + _proto_bytes(3, FIELD3_BYTES)
+    # ส่งแค่ field 2 = symbol (ไม่มี field 3)
+    proto  = _proto_string(2, symbol)
     frames = grpc_call(GRPC_BOND_SVC, "GetBySymbol", proto, token, session, referer=ref)
     logger.info(f"[GetBySymbol] {symbol}: {len(frames)} frames")
 
-    for frame in frames:
-        vals = _dump_all(frame)
-        logger.info(f"[GetBySymbol] vals: {str(vals)[:500]}")
-        c = _find_coupon(vals)
-        if c != "-":
-            logger.info(f"[GetBySymbol] coupon: {c}")
-            return c
+    for fi, frame in enumerate(frames):
+        logger.info(f"[frame{fi}] len={len(frame)} hex_start={frame[:20].hex()}")
 
-    # ลองไม่ส่ง field 3
-    proto2 = _proto_string(2, symbol)
-    frames2 = grpc_call(GRPC_BOND_SVC, "GetBySymbol", proto2, token, session, referer=ref)
-    logger.info(f"[GetBySymbol no-f3] {symbol}: {len(frames2)} frames")
-    for frame in frames2:
+        # Search for 7.5 in raw bytes
+        _find_75_in_frame(frame)
+
+        # Dump ALL values (no truncation)
         vals = _dump_all(frame)
-        logger.info(f"[GetBySymbol no-f3] vals: {str(vals)[:500]}")
-        c = _find_coupon(vals)
+        for path, val in vals:
+            logger.info(f"[val] {path} = {repr(val)[:80]}")
+
+        c = _find_coupon(vals, frame)
         if c != "-":
+            logger.info(f"[coupon] found: {c}")
             return c
 
     return "-"
 
 
-def _find_coupon(vals):
+def _find_coupon(vals, raw_frame=None):
+    """หา coupon rate จากทุก approach"""
+    # 1. หา float32/64 ที่เป็น 7.x ใน raw bytes
+    if raw_frame:
+        for i in range(len(raw_frame) - 3):
+            try:
+                v = struct.unpack_from("<f", raw_frame, i)[0]
+                if 0.5 <= v <= 30 and v % 0.25 == 0:  # coupon มักเป็น .25 increments
+                    logger.info(f"[raw_float32] offset={i} val={v}")
+            except Exception:
+                pass
+
+    # 2. หาจาก parsed values
     for path, val in vals:
         if isinstance(val, (int, float)):
             n = float(val)
             if 0.5 <= n <= 30 and n % 1 != 0:
                 if n < 1: n *= 100
                 return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+
+    # 3. หา pattern ใน strings
     for path, val in vals:
         if isinstance(val, str):
-            m = re.search(r"\b(\d+\.\d+)\s*%", val)
+            m = re.search(r"\b(\d+\.\d+)\s*%?", val)
             if m:
-                n = float(m.group(1))
-                if 0.5 <= n <= 30:
-                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                try:
+                    n = float(m.group(1))
+                    if 0.5 <= n <= 30:
+                        return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                except Exception:
+                    pass
+
     return "-"
 
 
@@ -286,7 +300,8 @@ def get_participants(symbol, issue_uuid, role, token, session):
 
 def api_get(url, session, ref=None):
     try:
-        r = session.get(url, headers={**HEADERS_BASE, "Accept": "application/json, */*", "Referer": ref or BASE_THAIBMA}, timeout=15)
+        r = session.get(url, headers={**HEADERS_BASE, "Accept": "application/json, */*",
+                                      "Referer": ref or BASE_THAIBMA}, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -377,33 +392,26 @@ def search_bonds_by_company(company_name):
     abbr    = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
     token = get_bearer_token(session)
-    logger.info(f"[main] token: {bool(token)}")
-
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
-
     for b in bonds[:15]:
         symbol   = b.get("symbol", "")
         issue_id = b.get("issue_id", "-")
         if not symbol or not token:
             continue
-
         time.sleep(0.3)
         coupon = get_coupon(symbol, token, session)
         if coupon != "-":
             b["coupon_rate"] = coupon
-
         time.sleep(0.2)
         uw = get_participants(symbol, issue_id, "UDW", token, session)
         if uw != "-":
             b["underwriters"] = uw
-
         time.sleep(0.2)
         rept = get_participants(symbol, issue_id, "REPT", token, session)
         if rept != "-":
             b["bondholder_rep"] = rept
-
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
 
