@@ -424,6 +424,7 @@ def _item_to_bond(item, term_type):
         "issue_id":         g("IssueID", "issueId"),
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
         "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
+        "raw_issue_date":   g("IssuedDate", "IssueDate"),  # for sorting
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
         "tenor":            g("Term", "term", "tenor"),
         "coupon_rate":      "-",
@@ -449,6 +450,14 @@ def search_bonds_by_company(company_name):
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
+
+    # เรียงจากล่าสุดไปเก่าสุด (MaturityDate descending → ใกล้ครบกำหนดน้อยสุดก่อน)
+    def sort_key(b):
+        raw = b.get("raw_issue_date", "") or ""
+        raw = raw.split("T")[0].strip()
+        return raw  # ISO format YYYY-MM-DD เรียง str ได้เลย
+
+    bonds.sort(key=sort_key, reverse=True)  # ล่าสุดก่อน
 
     for b in bonds[:15]:
         symbol   = b.get("symbol", "")
