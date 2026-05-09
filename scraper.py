@@ -16,7 +16,13 @@ BASE_IBOND   = "https://www.ibond.thaibma.or.th"
 BASE_THAIBMA = "https://www.thaibma.or.th"
 REGISSUE_URL = f"{BASE_THAIBMA}/issuer/regissue"
 ISSUER_URL   = f"{BASE_THAIBMA}/EN/Issuer/IssuerDetail.aspx"
-GRPC_SVC     = "bondsearch-grpc/BondSearchGrpc.Models.BondSearchGrpcService"
+
+# Service paths จาก Network tab จริงๆ
+GRPC_BOND_SVC   = "bond-grpc/bond.BondGrpcService"
+GRPC_SEARCH_SVC = "bondsearch-grpc/BondSearchGrpc.Models.BondSearchGrpcService"
+
+# Field 3 fixed bytes จาก browser payload (unknown purpose — ส่งไปด้วยเสมอ)
+FIELD3_BYTES = bytes.fromhex("2590adf8cf06")
 
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -37,6 +43,10 @@ def _proto_string(field_num, value):
     b = value.encode("utf-8") if isinstance(value, str) else value
     tag = (field_num << 3) | 2
     return bytes([tag]) + _encode_varint(len(b)) + b
+
+def _proto_bytes(field_num, data):
+    tag = (field_num << 3) | 2
+    return bytes([tag]) + _encode_varint(len(data)) + data
 
 def _grpc_encode(proto_bytes):
     header = struct.pack(">BI", 0, len(proto_bytes))
@@ -155,7 +165,7 @@ def get_bearer_token(session):
 
 # ─── gRPC call ────────────────────────────────────────────────────────────────
 
-def grpc_call(method, proto_bytes, token, session, referer=None):
+def grpc_call(svc, method, proto_bytes, token, session, referer=None):
     payload = _grpc_encode(proto_bytes)
     headers = {
         **HEADERS_BASE,
@@ -168,7 +178,7 @@ def grpc_call(method, proto_bytes, token, session, referer=None):
     }
     try:
         resp = session.post(
-            f"{BASE_IBOND}/grpc/{GRPC_SVC}/{method}",
+            f"{BASE_IBOND}/grpc/{svc}/{method}",
             data=payload, headers=headers, timeout=30,
         )
         logger.info(f"[grpc] {method}: status={resp.status_code}, len={len(resp.text)}")
@@ -179,89 +189,57 @@ def grpc_call(method, proto_bytes, token, session, referer=None):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
-# ─── GetBySymbol & GetBondFeature ─────────────────────────────────────────────
+# ─── GetBySymbol (bond detail) ────────────────────────────────────────────────
 
-def get_coupon(symbol, issue_uuid, token, session):
+def get_coupon(symbol, token, session):
     """
-    ลอง GetBySymbol และ GetBondFeature ซึ่งเห็นใน Network tab
-    ของหน้า ibond.thaibma.or.th/bonds?symbol=PCLV268A
+    เรียก bond-grpc/bond.BondGrpcService/GetBySymbol
+    ด้วย payload เดียวกับที่ browser ส่ง:
+      field 2 = symbol string
+      field 3 = fixed bytes 2590adf8cf06
     """
-    ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
+    ref   = f"{BASE_IBOND}/bonds?symbol={symbol}"
+    proto = _proto_string(2, symbol) + _proto_bytes(3, FIELD3_BYTES)
+    frames = grpc_call(GRPC_BOND_SVC, "GetBySymbol", proto, token, session, referer=ref)
+    logger.info(f"[GetBySymbol] {symbol}: {len(frames)} frames")
 
-    # ลอง GetBySymbol ก่อน (1.1 kB — น่าจะมี coupon)
-    for proto in [
-        _proto_string(1, symbol),
-        _proto_string(1, symbol.upper()),
-        _proto_string(2, symbol),
-    ]:
-        frames = grpc_call("GetBySymbol", proto, token, session, referer=ref)
-        logger.info(f"[GetBySymbol] {symbol}: {len(frames)} frames")
-        for frame in frames:
-            vals = _dump_all(frame)
-            logger.info(f"[GetBySymbol] vals: {str(vals)[:400]}")
-            c = _extract_coupon(vals)
-            if c != "-":
-                logger.info(f"[GetBySymbol] coupon: {c}")
-                return c
-
-    # ลอง GetBondFeature (1.8 kB)
-    for proto in [
-        _proto_string(1, symbol),
-        _proto_string(1, issue_uuid) if issue_uuid != "-" else None,
-    ]:
-        if proto is None:
-            continue
-        frames = grpc_call("GetBondFeature", proto, token, session, referer=ref)
-        logger.info(f"[GetBondFeature] {symbol}: {len(frames)} frames")
-        for frame in frames:
-            vals = _dump_all(frame)
-            logger.info(f"[GetBondFeature] vals: {str(vals)[:400]}")
-            c = _extract_coupon(vals)
-            if c != "-":
-                logger.info(f"[GetBondFeature] coupon: {c}")
-                return c
-
-    # ลอง GetBondHighlightFeature (1.4 kB)
-    for proto in [_proto_string(1, symbol)]:
-        frames = grpc_call("GetBondHighlightFeature", proto, token, session, referer=ref)
-        logger.info(f"[GetBondHighlightFeature] {symbol}: {len(frames)} frames")
-        for frame in frames:
-            vals = _dump_all(frame)
-            logger.info(f"[GetBondHighlightFeature] vals: {str(vals)[:400]}")
-            c = _extract_coupon(vals)
-            if c != "-":
-                return c
+    for frame in frames:
+        vals = _dump_all(frame)
+        logger.info(f"[GetBySymbol] vals: {str(vals)[:500]}")
+        c = _find_coupon(vals)
+        if c != "-":
+            logger.info(f"[GetBySymbol] coupon: {c}")
+            return c
 
     return "-"
 
 
-def _extract_coupon(vals):
-    """หา coupon rate จาก list ของ (path, value)"""
-    # ค้นหา "7.5" หรือตัวเลขที่มี decimal และอยู่ใน range coupon
+def _find_coupon(vals):
+    """หา coupon rate จาก dump values"""
+    # หา decimal number ระหว่าง 0.5-30 ที่ไม่ใช่ integer
     for path, val in vals:
         if isinstance(val, (int, float)):
             n = float(val)
-            # coupon rate ควรมี decimal part และอยู่ระหว่าง 0.5-30
-            if 0.5 <= n <= 30 and n != int(n):
+            if 0.5 <= n <= 30 and round(n, 4) != round(n):
                 if n < 1: n *= 100
                 return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
 
-    # ค้นหาใน string ที่มี % หรือ pattern coupon
+    # หา pattern X.X% ใน strings
     for path, val in vals:
         if isinstance(val, str):
-            # รูปแบบ "7.5%" หรือ "7.50"
             m = re.search(r"\b(\d+\.\d+)\s*%", val)
             if m:
                 n = float(m.group(1))
                 if 0.5 <= n <= 30:
                     return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            # รูปแบบ coupon ใน JSON-like string
-            m2 = re.search(r'"coupon[^"]*"\s*:\s*"?(\d+\.?\d*)"?', val, re.I)
-            if m2:
-                n = float(m2.group(1))
-                if 0.5 <= n <= 30:
-                    if n < 1: n *= 100
-                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+
+    # หา float ที่มี decimal ไม่ใช่ .0
+    for path, val in vals:
+        if isinstance(val, (int, float)):
+            n = float(val)
+            if 0.5 <= n <= 30 and n % 1 != 0:
+                if n < 1: n *= 100
+                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
 
     return "-"
 
@@ -273,11 +251,10 @@ def get_participants(symbol, issue_uuid, role, token, session):
     for proto in [
         _proto_string(1, symbol) + _proto_string(2, role),
         _proto_string(1, issue_uuid) + _proto_string(2, role) if issue_uuid != "-" else None,
-        _proto_string(1, symbol),
     ]:
         if proto is None:
             continue
-        frames = grpc_call("GetParticipants", proto, token, session, referer=ref)
+        frames = grpc_call(GRPC_SEARCH_SVC, "GetParticipants", proto, token, session, referer=ref)
         names = []
         for frame in frames:
             for fnum, wtype, val in _parse_proto(frame):
@@ -292,11 +269,9 @@ def get_participants(symbol, issue_uuid, role, token, session):
                                 if ss and len(ss) > 3 and ss not in names:
                                     names.append(ss)
         if names:
-            result = " / ".join(names)
-            logger.info(f"[participant] {role}: {result[:80]}")
-            return result
+            logger.info(f"[participant] {role}: {' / '.join(names)[:80]}")
+            return " / ".join(names)
     return "-"
-
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
 
@@ -406,7 +381,7 @@ def search_bonds_by_company(company_name):
             continue
 
         time.sleep(0.3)
-        coupon = get_coupon(symbol, issue_id, token, session)
+        coupon = get_coupon(symbol, token, session)
         if coupon != "-":
             b["coupon_rate"] = coupon
 
