@@ -14,8 +14,9 @@ HEADERS = {
 
 BASE         = "https://www.thaibma.or.th"
 REGISSUE_URL = f"{BASE}/issuer/regissue"
-BONDINFO_URL = f"{BASE}/EN/BondInfo/BondFeature"
+ISSUE_URL    = f"{BASE}/issue"
 ISSUER_URL   = f"{BASE}/EN/Issuer/IssuerDetail.aspx"
+BOND_PAGE    = f"{BASE}/EN/BondInfo/BondFeature/Issue.aspx"
 
 
 def fmt_date(raw):
@@ -40,9 +41,31 @@ def fmt_number(raw):
         return raw
 
 
+def warm_session(session):
+    """เข้าหน้าเว็บก่อนเพื่อได้ session cookie"""
+    try:
+        session.get(
+            BOND_PAGE,
+            headers={**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"},
+            timeout=15
+        )
+        logger.info("[session] warmed up")
+    except Exception as e:
+        logger.warning(f"[session] warm failed: {e}")
+
+
 def api_get(url, session, ref=None):
     try:
-        r = session.get(url, headers={**HEADERS, "Referer": ref or BASE}, timeout=15)
+        r = session.get(
+            url,
+            headers={**HEADERS, "Referer": ref or BOND_PAGE},
+            timeout=15
+        )
+        if r.status_code == 401 or "Authorization has been denied" in r.text:
+            logger.warning(f"[api_get] auth denied: {url} — retrying after warm")
+            warm_session(session)
+            time.sleep(0.5)
+            r = session.get(url, headers={**HEADERS, "Referer": ref or BOND_PAGE}, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -71,7 +94,7 @@ def parse_participant(data, role):
 def parse_coupon(data):
     if not data:
         return "-"
-    logger.info(f"[coupon] raw data: {str(data)[:200]}")
+    logger.info(f"[coupon] raw: {str(data)[:200]}")
     items = data if isinstance(data, list) else [data]
     for item in items:
         if not isinstance(item, dict):
@@ -82,25 +105,26 @@ def parse_coupon(data):
             if val is None or str(val).strip() in ["", "null", "None", "-"]:
                 continue
             v = str(val).strip()
-            # Fixed: 7.5 หรือ Fixed:0.075
             m = re.search(r"Fixed\s*:?\s*([\d.]+)", v, re.I)
             if m:
                 n = float(m.group(1))
-                if n < 1: n *= 100
+                if n < 1:
+                    n *= 100
                 return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            # ตัวเลขล้วน
             try:
                 n = float(v)
                 if 0 < n <= 50:
-                    if n < 1: n *= 100
+                    if n < 1:
+                        n *= 100
                     return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
             except ValueError:
                 pass
-            # FRN
             if any(k in v.upper() for k in ["FRN", "FLOAT", "MLR", "MOR", "TBR"]):
                 return v[:40]
     return "-"
 
+
+# ─── STEP 1: Bond List ────────────────────────────────────────────────────────
 
 def fetch_bond_list(abbr_name, session):
     all_bonds = []
@@ -165,33 +189,35 @@ def _item_to_bond(item, term_type):
     }
 
 
+# ─── STEP 2: Coupon + Participants ────────────────────────────────────────────
+
 def fetch_bond_apis(symbol, session):
     detail = {}
-    ref = f"{BASE}/EN/BondInfo/BondFeature/Issue.aspx"
+    ref = BOND_PAGE
 
     # Coupon
-    coupon_data = api_get(f"{BONDINFO_URL}/couponpaymentreference?Symbol={symbol}", session, ref)
+    coupon_data = api_get(f"{ISSUE_URL}/couponpaymentreference?Symbol={symbol}", session, ref)
     coupon = parse_coupon(coupon_data)
     if coupon != "-":
         detail["coupon_rate"] = coupon
     time.sleep(0.2)
 
     # Underwriter
-    uw_data = api_get(f"{BONDINFO_URL}/participant?Symbol={symbol}&InstitutionRole=UDW", session, ref)
+    uw_data = api_get(f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=UDW", session, ref)
     uw = parse_participant(uw_data, "UDW")
     if uw != "-":
         detail["underwriters"] = uw
     time.sleep(0.2)
 
     # BH Rep
-    rept_data = api_get(f"{BONDINFO_URL}/participant?Symbol={symbol}&InstitutionRole=REPT", session, ref)
+    rept_data = api_get(f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=REPT", session, ref)
     rept = parse_participant(rept_data, "REPT")
     if rept != "-":
         detail["bondholder_rep"] = rept
     time.sleep(0.2)
 
     # Registrar
-    regt_data = api_get(f"{BONDINFO_URL}/participant?Symbol={symbol}&InstitutionRole=REGT", session, ref)
+    regt_data = api_get(f"{ISSUE_URL}/participant?Symbol={symbol}&InstitutionRole=REGT", session, ref)
     regt = parse_participant(regt_data, "REGT")
     if regt != "-":
         detail["registrar"] = regt
@@ -199,13 +225,20 @@ def fetch_bond_apis(symbol, session):
     return detail
 
 
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
 def search_bonds_by_company(company_name):
     session = requests.Session()
     abbr = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
+
+    # warm session ก่อน
+    warm_session(session)
+
     bonds = fetch_bond_list(abbr, session)
     if not bonds:
         return []
+
     results = []
     for b in bonds[:15]:
         symbol = b.get("symbol", "")
@@ -216,9 +249,12 @@ def search_bonds_by_company(company_name):
                 if k not in b or b[k] == "-":
                     b[k] = v
         results.append(b)
+
     logger.info(f"[main] Done: {len(results)} bonds")
     return results
 
+
+# ─── FORMAT ───────────────────────────────────────────────────────────────────
 
 def format_bond_message(bonds, company_name):
     if not bonds:
