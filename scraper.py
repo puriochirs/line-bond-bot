@@ -14,7 +14,7 @@ HEADERS = {
 
 BASE         = "https://www.thaibma.or.th"
 REGISSUE_URL = f"{BASE}/issuer/regissue"
-BONDINFO_URL = f"{BASE}/bondinfo"
+BONDINFO_URL = f"{BASE}/EN/BondInfo/BondFeature"
 ISSUER_URL   = f"{BASE}/EN/Issuer/IssuerDetail.aspx"
 
 
