@@ -90,10 +90,7 @@ def _item_to_bond(item: dict, term_type: str):
         return None
 
     secure_code = g("SecureCode", "securedType", "SecuredType")
-    if "unsecure" in secure_code.lower() or secure_code == "-":
-        secured_label = "🔓 ไม่มีหลักประกัน"
-    else:
-        secured_label = "🔒 มีหลักประกัน"
+    secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
 
     bond = {
         "symbol":           symbol,
@@ -116,93 +113,88 @@ def _item_to_bond(item: dict, term_type: str):
     }
 
     issue_id = g("IssueID", "issueId", "id", "Id")
+    logger.info(f"[item] {symbol}: IssueID={issue_id}")
     if issue_id != "-":
         bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
 
     return bond
 
 
-# ─── STEP 2: Bond Detail Page ─────────────────────────────────────────────────
+# ─── STEP 2: Bond Detail — regex on full page text ───────────────────────────
 
 def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
-    """
-    ดึงข้อมูลจากหน้า bond detail
-    รองรับ multi-row tables เช่น Coupon Payment ที่ label/value อยู่คนละแถว
-    """
     detail = {}
     if not detail_url:
         return detail
     try:
-        logger.info(f"[detail] Fetching: {detail_url}")
+        logger.info(f"[detail] GET {detail_url}")
         resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
+        logger.info(f"[detail] status={resp.status_code} len={len(resp.text)}")
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
 
+        soup = BeautifulSoup(resp.text, "lxml")
+        # ดึง text ทั้งหน้าสำหรับ regex
+        full_text = soup.get_text(separator="\n")
+
+        # ── Coupon Rate: หา "Fixed: X.X%" ในข้อความทั้งหน้า ──
+        m = re.search(r"Fixed[:\s]+([\d.]+)\s*%", full_text, re.I)
+        if m:
+            detail["coupon_rate"] = m.group(1) + "%"
+            logger.info(f"[detail] coupon found: {detail['coupon_rate']}")
+        else:
+            # FRN/Floating
+            m2 = re.search(r"(FRN|Floating|TBR[+-][\d.]+|MLR[+-][\d.]+|MOR[+-][\d.]+)", full_text, re.I)
+            if m2:
+                detail["coupon_rate"] = m2.group(1)
+                logger.info(f"[detail] coupon FRN: {detail['coupon_rate']}")
+            else:
+                logger.info(f"[detail] coupon NOT found. Snippet: {full_text[full_text.lower().find('coupon')-20:full_text.lower().find('coupon')+80] if 'coupon' in full_text.lower() else 'no coupon keyword'}")
+
+        # ── Underwriter(s): ดึงจาก table parser ──
+        uw_list = []
         for table in soup.find_all("table"):
             rows = table.find_all("tr")
-            pending_label = None  # label ที่รอ value จากแถวถัดไป
-
+            in_uw_section = False
             for row in rows:
                 cells = row.find_all(["td", "th"])
                 if not cells:
                     continue
+                first = cells[0].get_text(strip=True).lower()
+                row_text = " ".join(c.get_text(strip=True) for c in cells)
 
-                first_cell_text = cells[0].get_text(strip=True).lower()
-                all_text = " ".join(c.get_text(strip=True) for c in cells)
-
-                # ── กรณี: label อยู่ซ้าย value อยู่ขวา (2+ cells, same row) ──
-                if len(cells) >= 2:
-                    label = first_cell_text
-                    value = cells[1].get_text(" ", strip=True)
-                    _assign(detail, label, value)
-
-                    # 4-cell row: 2 pairs
-                    if len(cells) >= 4:
-                        label2 = cells[2].get_text(strip=True).lower()
-                        value2 = cells[3].get_text(" ", strip=True)
-                        _assign(detail, label2, value2)
-
-                # ── กรณีพิเศษ: "Coupon Payment" เป็น label ของ section ──
-                # แถวนี้มี "coupon payment" และ sub-headers เช่น Reference/Max/Min/From/To
-                if "coupon payment" in first_cell_text or "coupon payment" in all_text.lower():
-                    pending_label = "coupon payment"
+                # เจอ header "Underwriter"
+                if "underwriter" in first:
+                    in_uw_section = True
+                    # value อาจอยู่ใน cell ถัดไปในแถวเดียวกัน
+                    for c in cells[1:]:
+                        v = c.get_text(strip=True)
+                        if v and v not in uw_list and len(v) > 3:
+                            uw_list.append(v)
                     continue
 
-                # ── ถ้ามี pending_label รอ value จากแถวนี้ ──
-                if pending_label == "coupon payment" and detail.get("coupon_rate", "-") == "-":
-                    # หา "Fixed: X.X%" ในแถวนี้
-                    for cell in cells:
-                        cell_text = cell.get_text(strip=True)
-                        m = re.search(r"Fixed:\s*([\d.]+)\s*%?", cell_text, re.I)
-                        if m:
-                            detail["coupon_rate"] = m.group(1) + "%"
-                            logger.info(f"[detail] coupon found (multi-row): {detail['coupon_rate']}")
-                            pending_label = None
-                            break
-                        # FRN หรือ Floating rate
-                        if any(k in cell_text.lower() for k in ["frn", "floating", "tbr", "mlr", "mor"]):
-                            detail["coupon_rate"] = cell_text[:40]
-                            pending_label = None
-                            break
+                # ถ้าอยู่ใน section underwriter และยังไม่เจอ section อื่น
+                if in_uw_section:
+                    # ถ้าเจอ label อื่น ออกจาก section
+                    if first and any(k in first for k in ["financial", "registrar", "bondholder", "guarantor", "rating", "symbol", "issuer", "distribution"]):
+                        in_uw_section = False
+                        continue
+                    # เก็บทุก cell ที่ไม่ว่าง
+                    for c in cells:
+                        v = c.get_text(strip=True)
+                        if v and v not in uw_list and len(v) > 3:
+                            uw_list.append(v)
 
-                # ── Underwriter(s): อาจอยู่หลายแถว ──
-                if "underwriter" in first_cell_text:
-                    # เก็บทุก cell ที่ไม่ใช่ label
-                    uw_parts = [c.get_text(strip=True) for c in cells[1:] if c.get_text(strip=True)]
-                    if uw_parts:
-                        existing = detail.get("underwriters", "")
-                        new_part = " / ".join(uw_parts)
-                        detail["underwriters"] = (existing + " / " + new_part).strip(" /") if existing and existing != "-" else new_part
+        if uw_list:
+            detail["underwriters"] = " / ".join(uw_list)
+            logger.info(f"[detail] underwriters: {detail['underwriters'][:80]}")
+        else:
+            logger.info(f"[detail] underwriters NOT found")
 
-        # สร้าง secured label จาก detail
-        st = detail.get("secured_type", "").lower()
-        bt = detail.get("bond_type", "").lower()
-        if "unsecure" in st or "unsecure" in bt:
+        # ── Secured Label ──
+        if "unsecured" in full_text.lower() or "unsecure" in full_text.lower():
             detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
-        elif "secure" in st or "fasset" in st or "secure" in bt:
+        elif any(k in full_text for k in ["Secured", "FASSET"]):
             detail["secured_label"] = "🔒 มีหลักประกัน"
-
-        logger.info(f"[detail] result: coupon={detail.get('coupon_rate','?')}, uw={detail.get('underwriters','?')[:50]}")
 
     except Exception as e:
         logger.exception(f"[detail] error: {e}")
@@ -271,50 +263,3 @@ def format_bond_message(bonds: list, company_name: str) -> str:
     add_bonds(short_bonds, "📌 Short Term Debenture")
     lines.extend(["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"])
     return "\n".join(lines)
-
-
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-
-def _assign(d: dict, label: str, value: str):
-    v = value.strip()
-    if not label or not v or v in ["-", "null"]:
-        return
-    if "symbol" in label and not d.get("symbol"):
-        d["symbol"] = v.split()[0]
-    elif "issue date" in label and "registration" not in label and not d.get("issue_date"):
-        d["issue_date"] = fmt_date(v)
-    elif "maturity date" in label and not d.get("maturity_date"):
-        d["maturity_date"] = fmt_date(v)
-    elif "issue term" in label:
-        d["tenor"] = v.split("/")[0].strip()
-    elif "coupon payment" in label:
-        # same-row case
-        m = re.search(r"Fixed:\s*([\d.]+)", v, re.I)
-        if m:
-            d["coupon_rate"] = m.group(1) + "%"
-        elif any(k in v.lower() for k in ["frn", "floating", "tbr", "mlr", "mor"]):
-            d["coupon_rate"] = v[:60]
-    elif "bond type" in label:
-        d["bond_type"] = v
-    elif "secured type" in label or label == "collateral":
-        d["secured_type"] = v
-    elif "registrar" in label and "co-" not in label and not d.get("registrar"):
-        d["registrar"] = v
-    elif "debenture holder" in label or "bondholder rep" in label:
-        d["bondholder_rep"] = v
-    elif "underwriter" in label:
-        existing = d.get("underwriters", "")
-        if not existing or existing == "-":
-            d["underwriters"] = v
-        elif v not in existing:
-            d["underwriters"] = existing + " / " + v
-    elif "financial advisor" in label:
-        d["financial_advisor"] = v
-    elif "outstanding size" in label:
-        d["outstanding_size"] = v
-    elif "issue size" in label and "outstanding" not in label:
-        d["issue_size"] = v
-    elif "issue rating" in label:
-        d["issue_rating"] = v
-    elif "issuer rating" in label and "issue " not in label:
-        d["issuer_rating"] = v
