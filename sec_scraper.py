@@ -63,7 +63,11 @@ def shorten_bond_name(name: str) -> str:
 
 
 def get_unique_id(abbr: str, session: requests.Session) -> str:
-    """Step 1: ได้ UniqueIdReference จากชื่อย่อบริษัท"""
+    """
+    Step 1: ได้ Value (company id) จากชื่อย่อบริษัท
+    API คืน list ของ {"Text": "COMPANY NAME", "Value": "0000008139", "Flag": false}
+    → หา exact match ก่อน ถ้าไม่มีค่อยเอา prefix match / fallback
+    """
     try:
         resp = session.post(
             COMPANY_URL,
@@ -74,28 +78,35 @@ def get_unique_id(abbr: str, session: requests.Session) -> str:
         logger.info(f"[sec] valuebyuniqueid: status={resp.status_code}, len={len(resp.text)}")
         if resp.status_code != 200:
             return ""
+
         data = resp.json()
-        logger.info(f"[sec] unique id raw type={type(data).__name__}: {str(data)[:400]}")
+        logger.info(f"[sec] items={len(data) if isinstance(data, list) else 'n/a'}")
 
-        # parse UniqueIdReference จาก response
-        if isinstance(data, list) and data:
-            first = data[0]
-            uid = (first.get("UniqueIdReference") or first.get("uniqueIdReference") or
-                   first.get("CompanyId") or first.get("companyId") or "")
-            if uid:
-                return str(uid).zfill(10)
+        if not isinstance(data, list) or not data:
+            return ""
 
-        if isinstance(data, dict):
-            uid = (data.get("UniqueIdReference") or data.get("uniqueIdReference") or
-                   data.get("CompanyId") or "")
-            if uid:
-                return str(uid).zfill(10)
+        abbr_upper = abbr.upper()
 
-        # ลอง parse string ที่อาจมี UniqueIdReference
-        text = resp.text
-        m = re.search(r'"UniqueIdReference"\s*:\s*"?(\d+)"?', text, re.I)
-        if m:
-            return m.group(1).zfill(10)
+        # 1) exact match: Text (strip comma/space) == ABBR
+        for item in data:
+            text = item.get("Text", "").upper().strip().rstrip(",").strip()
+            if text == abbr_upper:
+                uid = item.get("Value", "")
+                logger.info(f"[sec] exact match: {item['Text']!r} -> {uid}")
+                return uid
+
+        # 2) prefix match: Text ขึ้นต้นด้วย "ABBR " (มี space ตาม)
+        for item in data:
+            text = item.get("Text", "").upper()
+            if text.startswith(abbr_upper + " "):
+                uid = item.get("Value", "")
+                logger.info(f"[sec] prefix match: {item['Text']!r} -> {uid}")
+                return uid
+
+        # 3) fallback: เอาอันแรกสุด
+        uid = data[0].get("Value", "")
+        logger.info(f"[sec] fallback first: {data[0].get('Text')!r} -> {uid}")
+        return uid
 
     except Exception as e:
         logger.warning(f"[sec] get_unique_id error: {e}")
