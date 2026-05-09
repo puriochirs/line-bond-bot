@@ -16,6 +16,9 @@ app = Flask(__name__)
 LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_REPLY_URL            = "https://api.line.me/v2/bot/message/reply"
+LINE_PUSH_URL             = "https://api.line.me/v2/bot/message/push"
+LINE_MAX_CHARS            = 4900   # safe limit per message
+LINE_MAX_MSGS             = 5      # LINE allows max 5 per reply
 
 HELP_TEXT = (
     "🤖 Bond Info Bot\n\n"
@@ -34,86 +37,72 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def split_message(text: str, max_len: int = 4800) -> list:
-    """
-    แบ่งข้อความให้แต่ละ chunk ไม่เกิน max_len chars
-    พยายามตัดที่ bond boundary (🔹) ไม่ใช่กลางบรรทัด
-    """
-    if len(text) <= max_len:
-        return [text]
-
-    chunks = []
-    lines  = text.split("\n")
-    current = ""
-
-    for line in lines:
-        addition = ("\n" + line) if current else line
-        if len(current) + len(addition) > max_len:
-            if current:
-                chunks.append(current.rstrip())
-            # ถ้า line เดียวยาวเกิน ตัดทิ้ง
-            current = line[:max_len]
-        else:
-            current += addition
-
-    if current.strip():
-        chunks.append(current.rstrip())
-
-    # ตรวจสอบอีกครั้งว่าทุก chunk ไม่เกิน max_len
-    safe = []
-    for c in chunks:
-        if len(c) <= max_len:
-            safe.append(c)
-        else:
-            safe.append(c[:max_len])
-
-    return safe
-
-
-def reply_text(reply_token: str, text: str):
-    """ส่ง text reply กลับไปยัง LINE (รองรับข้อความยาวสูงสุด 5 messages)"""
+def hard_split(text: str, max_len: int = LINE_MAX_CHARS) -> list:
+    """ตัดข้อความเป็น chunks แบบ hard cut ไม่เกิน max_len chars"""
     if not text:
+        return []
+    chunks = []
+    while text:
+        chunks.append(text[:max_len])
+        text = text[max_len:]
+    return chunks
+
+
+def reply_messages(reply_token: str, chunks: list):
+    """ส่ง reply สูงสุด 5 messages"""
+    if not chunks:
         return
-
-    chunks = split_message(text)
-    # LINE รองรับสูงสุด 5 messages ต่อ reply
-    chunks = chunks[:5]
-
-    messages = [{"type": "text", "text": c} for c in chunks]
-
-    payload = {"replyToken": reply_token, "messages": messages}
-    headers = {
+    messages = [{"type": "text", "text": c} for c in chunks[:LINE_MAX_MSGS]]
+    payload  = {"replyToken": reply_token, "messages": messages}
+    headers  = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
-
-    logger.info(f"[reply] Sending {len(messages)} message(s), total chars: {len(text)}")
-    logger.info(f"[reply] First 200 chars: {text[:200]}")
-
+    logger.info(f"[reply] Sending {len(messages)} msg(s), chars: {[len(c) for c in chunks[:LINE_MAX_MSGS]]}")
     try:
         resp = requests.post(LINE_REPLY_URL, headers=headers, json=payload, timeout=15)
         logger.info(f"[reply] LINE API status: {resp.status_code}")
         if resp.status_code != 200:
-            logger.error(f"[reply] LINE API error: {resp.status_code} | {resp.text}")
-        else:
-            logger.info(f"[reply] LINE API success: {resp.text[:100]}")
+            logger.error(f"[reply] error: {resp.text[:200]}")
     except Exception as e:
         logger.exception(f"[reply] Exception: {e}")
 
 
+def push_messages(user_id: str, chunks: list):
+    """Push ข้อความที่เกิน 5 messages ผ่าน push API"""
+    if not chunks:
+        return
+    # ส่งเป็นกลุ่มๆ ละ 5
+    for i in range(0, len(chunks), LINE_MAX_MSGS):
+        batch = chunks[i:i+LINE_MAX_MSGS]
+        messages = [{"type": "text", "text": c} for c in batch]
+        payload  = {"to": user_id, "messages": messages}
+        headers  = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        }
+        try:
+            resp = requests.post(LINE_PUSH_URL, headers=headers, json=payload, timeout=15)
+            logger.info(f"[push] batch {i//LINE_MAX_MSGS+1}: status={resp.status_code}")
+        except Exception as e:
+            logger.exception(f"[push] Exception: {e}")
+
+
 def handle_message(event: dict):
     reply_token = event.get("replyToken", "")
-    msg = event.get("message", {})
+    source      = event.get("source", {})
+    user_id     = source.get("userId", "")
+    msg         = event.get("message", {})
 
     if msg.get("type") != "text":
-        reply_text(reply_token, "กรุณาพิมพ์ชื่อย่อบริษัทที่ต้องการครับ 🙏")
+        reply_messages(reply_token, ["กรุณาพิมพ์ชื่อย่อบริษัทที่ต้องการครับ 🙏"])
         return
 
     user_text = msg.get("text", "").strip()
     logger.info(f"[msg] User input: '{user_text}'")
 
     if user_text.lower() in ["help", "ช่วยเหลือ", "วิธีใช้", "?"]:
-        reply_text(reply_token, HELP_TEXT)
+        reply_messages(reply_token, [HELP_TEXT])
         return
 
     try:
@@ -123,9 +112,24 @@ def handle_message(event: dict):
         logger.info(f"[msg] Formatted message length: {len(response_msg)}")
     except Exception as e:
         logger.exception(f"[msg] Error: {e}")
-        response_msg = "❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งครับ"
+        reply_messages(reply_token, ["❌ เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้งครับ"])
+        return
 
-    reply_text(reply_token, response_msg)
+    chunks = hard_split(response_msg)
+    logger.info(f"[msg] Split into {len(chunks)} chunks")
+
+    if len(chunks) <= LINE_MAX_MSGS:
+        # ส่งด้วย reply ครั้งเดียว
+        reply_messages(reply_token, chunks)
+    else:
+        # ส่ง 5 แรกด้วย reply แล้วที่เหลือ push
+        reply_messages(reply_token, chunks[:LINE_MAX_MSGS])
+        if user_id:
+            remaining = chunks[LINE_MAX_MSGS:]
+            logger.info(f"[msg] Pushing {len(remaining)} more chunks to {user_id}")
+            push_messages(user_id, remaining)
+        else:
+            logger.warning("[msg] No user_id, cannot push remaining chunks")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -146,7 +150,7 @@ def webhook():
         if event.get("type") == "message":
             handle_message(event)
         elif event.get("type") == "follow":
-            reply_text(event.get("replyToken", ""), HELP_TEXT)
+            reply_messages(event.get("replyToken", ""), [HELP_TEXT])
 
     return "OK", 200
 
