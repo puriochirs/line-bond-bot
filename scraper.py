@@ -22,7 +22,6 @@ ISSUER_DETAIL = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
 
 
 def fmt_date(raw: str) -> str:
-    """2023-12-28T00:00:00 → 28 Dec 2023"""
     if not raw or raw in ["-", "null", "None"]:
         return "-"
     raw = raw.split("T")[0].strip()
@@ -35,7 +34,6 @@ def fmt_date(raw: str) -> str:
 
 
 def fmt_number(raw: str) -> str:
-    """509.900000 → 509.90"""
     if not raw or raw == "-":
         return "-"
     try:
@@ -89,6 +87,9 @@ def _item_to_bond(item: dict, term_type: str):
     if symbol == "-":
         return None
 
+    # Log all keys in first item for debugging
+    logger.info(f"[item] {symbol} keys: {list(item.keys())}")
+
     secure_code = g("SecureCode", "securedType", "SecuredType")
     if "unsecure" in secure_code.lower() or secure_code == "-":
         secured_label = "🔓 ไม่มีหลักประกัน"
@@ -115,9 +116,17 @@ def _item_to_bond(item: dict, term_type: str):
         "isin":             g("IssueLegacyID", "isinCode", "ISIN"),
     }
 
+    # Log IssueID format
     issue_id = g("IssueID", "issueId", "id", "Id")
+    logger.info(f"[item] {symbol} IssueID='{issue_id}' IssueLegacyID='{g('IssueLegacyID')}'")
+
     if issue_id != "-":
         bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
+    
+    # Fallback: try using IssueLegacyID (ISIN) to build URL
+    legacy = g("IssueLegacyID")
+    if legacy != "-" and not bond.get("detail_url"):
+        bond["detail_url"] = f"{BOND_INFO_URL}?symbol={legacy}"
 
     return bond
 
@@ -127,9 +136,14 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
     if not detail_url:
         return detail
     try:
+        logger.info(f"[detail] Fetching: {detail_url}")
         resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
+        logger.info(f"[detail] Status: {resp.status_code}, len={len(resp.text)}")
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
+
+        # Log all label-value pairs found
+        all_pairs = []
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
@@ -141,15 +155,22 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
                     pairs.append((cells[2].get_text(strip=True).lower(),
                                   cells[3].get_text(" ", strip=True)))
                 for label, value in pairs:
+                    if label and value.strip():
+                        all_pairs.append(f"{label}={value[:40]}")
                     _assign(detail, label, value)
+
+        logger.info(f"[detail] pairs found: {all_pairs[:20]}")
+        logger.info(f"[detail] coupon_rate={detail.get('coupon_rate','MISSING')}, underwriters={detail.get('underwriters','MISSING')}")
+
         st = detail.get("secured_type", "").lower()
         bt = detail.get("bond_type", "").lower()
         if "unsecure" in st or "unsecure" in bt:
             detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
         elif "secure" in st or "fasset" in st or "secure" in bt:
             detail["secured_label"] = "🔒 มีหลักประกัน"
+
     except Exception as e:
-        logger.exception(f"[detail] {detail_url}: {e}")
+        logger.exception(f"[detail] error: {e}")
     return detail
 
 
