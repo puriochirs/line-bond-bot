@@ -75,7 +75,7 @@ def get_unique_id(abbr: str, session: requests.Session) -> str:
         if resp.status_code != 200:
             return ""
         data = resp.json()
-        logger.info(f"[sec] unique id raw: {str(data)[:200]}")
+        logger.info(f"[sec] unique id raw type={type(data).__name__}: {str(data)[:400]}")
 
         # parse UniqueIdReference จาก response
         if isinstance(data, list) and data:
@@ -142,7 +142,9 @@ def get_filings_html(unique_id: str, session: requests.Session) -> str:
         if resp.status_code != 200:
             return ""
         data = resp.json()
-        return data.get("content", "") or ""
+        content = data.get("content", "") or ""
+        logger.info(f"[sec] content len={len(content)}, preview={content[:200]!r}")
+        return content
     except Exception as e:
         logger.warning(f"[sec] get_filings_html error: {e}")
     return ""
