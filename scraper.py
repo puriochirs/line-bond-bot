@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -15,70 +16,64 @@ HEADERS = {
 }
 
 BASE_URL      = "https://www.thaibma.or.th"
-REGISSUE_URL  = f"{BASE_URL}/issuer/regissue"          # JSON API
+REGISSUE_URL  = f"{BASE_URL}/issuer/regissue"
 BOND_INFO_URL = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
 ISSUER_DETAIL = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 1: ดึง bond list จาก JSON API
-# ─────────────────────────────────────────────────────────────────────────────
+def fmt_date(raw: str) -> str:
+    """2023-12-28T00:00:00 → 28 Dec 2023"""
+    if not raw or raw in ["-", "null", "None"]:
+        return "-"
+    raw = raw.split("T")[0].strip()
+    for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"]:
+        try:
+            return datetime.strptime(raw, fmt).strftime("%-d %b %Y")
+        except ValueError:
+            continue
+    return raw
 
-def fetch_bond_list(abbr_name: str, session: requests.Session) -> list[dict]:
-    """
-    เรียก API:
-      GET /issuer/regissue?abbrName={TICKER}&term=long   → Long Term Debenture
-      GET /issuer/regissue?abbrName={TICKER}&term=short  → Short Term Debenture
-    คืน list ของ bond dicts พร้อม symbol, dates, term, secured, etc.
-    """
+
+def fmt_number(raw: str) -> str:
+    """509.900000 → 509.90"""
+    if not raw or raw == "-":
+        return "-"
+    try:
+        n = float(raw)
+        if n == int(n):
+            return f"{int(n):,}"
+        return f"{n:,.2f}"
+    except Exception:
+        return raw
+
+
+def fetch_bond_list(abbr_name: str, session: requests.Session) -> list:
     all_bonds = []
     ref = f"{ISSUER_DETAIL}?issuer={abbr_name.lower()}"
-
     for term in ["long", "short"]:
         url = f"{REGISSUE_URL}?abbrName={abbr_name}&term={term}"
         try:
-            resp = session.get(
-                url,
-                headers={**HEADERS, "Referer": ref},
-                timeout=20,
-            )
+            resp = session.get(url, headers={**HEADERS, "Referer": ref}, timeout=20)
             resp.raise_for_status()
-
-            logger.info(f"[api] {term}: status={resp.status_code}, len={len(resp.text)}, ct={resp.headers.get('Content-Type','')}")
-
-            # Parse JSON
             data = resp.json()
-            logger.info(f"[api] {term}: got {len(data) if isinstance(data, list) else type(data)} items")
-
-            if isinstance(data, list):
-                for item in data:
-                    bond = _item_to_bond(item, term)
-                    if bond:
-                        all_bonds.append(bond)
-            elif isinstance(data, dict):
-                # อาจอยู่ใน key เช่น "data", "result", "bonds"
+            items = data if isinstance(data, list) else []
+            if isinstance(data, dict):
                 for key in ["data", "result", "bonds", "items", "records", "value"]:
                     if key in data and isinstance(data[key], list):
-                        for item in data[key]:
-                            bond = _item_to_bond(item, term)
-                            if bond:
-                                all_bonds.append(bond)
+                        items = data[key]
                         break
-                # ถ้าไม่มี key ที่รู้จัก log raw data
-                if not all_bonds:
-                    logger.info(f"[api] {term}: dict keys = {list(data.keys())[:10]}")
-
-        except json.JSONDecodeError as e:
-            logger.warning(f"[api] {term}: JSON decode error: {e}, raw={resp.text[:200]}")
+            for item in items:
+                bond = _item_to_bond(item, term)
+                if bond:
+                    all_bonds.append(bond)
+            logger.info(f"[api] {term}: {len(items)} items")
         except Exception as e:
-            logger.exception(f"[api] {term}: error: {e}")
-
-    logger.info(f"[api] Total bonds from API: {len(all_bonds)}")
+            logger.exception(f"[api] {term}: {e}")
+    logger.info(f"[api] Total: {len(all_bonds)} bonds")
     return all_bonds
 
 
-def _item_to_bond(item: dict, term_type: str) -> dict | None:
-    """แปลง JSON item เป็น bond dict — ใช้ key จริงจาก ThaiBMA API"""
+def _item_to_bond(item: dict, term_type: str):
     if not isinstance(item, dict):
         return None
 
@@ -86,7 +81,7 @@ def _item_to_bond(item: dict, term_type: str) -> dict | None:
         for k in keys:
             if k in item and item[k] is not None:
                 v = str(item[k]).strip()
-                if v and v not in ["", "null", "None", "0"]:
+                if v and v not in ["", "null", "None"]:
                     return v
         return "-"
 
@@ -94,25 +89,21 @@ def _item_to_bond(item: dict, term_type: str) -> dict | None:
     if symbol == "-":
         return None
 
-    # SecureCode: FASSET = มีหลักประกัน, UNSECURE = ไม่มี
     secure_code = g("SecureCode", "securedType", "SecuredType")
-    sc_lower = secure_code.lower()
-    if "unsecure" in sc_lower:
-        secured_label = "🔓 ไม่มีหลักประกัน (Unsecured)"
-    elif secure_code != "-":
-        secured_label = f"🔒 มีหลักประกัน ({secure_code})"
-    else:
+    if "unsecure" in secure_code.lower() or secure_code == "-":
         secured_label = "🔓 ไม่มีหลักประกัน"
+    else:
+        secured_label = "🔒 มีหลักประกัน"
 
     bond = {
         "symbol":           symbol,
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
-        "issue_date":       g("IssuedDate", "IssueDate", "issueDate"),
-        "maturity_date":    g("MaturityDate", "maturityDate"),
+        "issue_date":       fmt_date(g("IssuedDate", "IssueDate", "issueDate")),
+        "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
         "tenor":            g("Term", "term", "tenor"),
-        "coupon_rate":      g("MarketYield", "CouponRate", "couponRate", "Coupon"),
-        "issue_size":       g("IssueSize", "issueSize"),
-        "outstanding_size": g("CurrentOutstanding", "IssueOutstanding", "outstanding"),
+        "coupon_rate":      "-",
+        "issue_size":       fmt_number(g("IssueSize", "issueSize")),
+        "outstanding_size": fmt_number(g("CurrentOutstanding", "IssueOutstanding", "outstanding")),
         "secured_type":     secure_code,
         "secured_label":    secured_label,
         "registrar":        g("Registrar", "registrar"),
@@ -121,24 +112,15 @@ def _item_to_bond(item: dict, term_type: str) -> dict | None:
         "issue_rating":     g("IssueRating", "issueRating"),
         "issuer_rating":    g("CompanyRating", "issuerRating"),
         "distribution":     g("DistributionDisplay", "distribution"),
-        "attribute":        g("AttributeDisplay", "attribute"),
-        "esg":              g("ESGDisplay", "esg"),
         "isin":             g("IssueLegacyID", "isinCode", "ISIN"),
     }
 
-    # หา detail URL จาก IssueID หรือ GUID
     issue_id = g("IssueID", "issueId", "id", "Id")
-    if issue_id != "-" and "-" in issue_id:  # UUID pattern
-        bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
-    elif issue_id != "-":
+    if issue_id != "-":
         bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
 
     return bond
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2: ดึง detail จากหน้า Bond Detail (optional — ถ้า API ไม่มีข้อมูลครบ)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
     detail = {}
@@ -160,60 +142,39 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
                                   cells[3].get_text(" ", strip=True)))
                 for label, value in pairs:
                     _assign(detail, label, value)
-
         st = detail.get("secured_type", "").lower()
         bt = detail.get("bond_type", "").lower()
         if "unsecure" in st or "unsecure" in bt:
-            detail["secured_label"] = "🔓 ไม่มีหลักประกัน (Unsecured)"
+            detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
         elif "secure" in st or "fasset" in st or "secure" in bt:
-            detail["secured_label"] = "🔒 มีหลักประกัน (Secured)"
-
+            detail["secured_label"] = "🔒 มีหลักประกัน"
     except Exception as e:
         logger.exception(f"[detail] {detail_url}: {e}")
     return detail
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def search_bonds_by_company(company_name: str) -> list[dict]:
+def search_bonds_by_company(company_name: str) -> list:
     session = requests.Session()
     abbr = company_name.strip().upper()
     logger.info(f"[main] === Searching: '{abbr}' ===")
-
-    # Step 1: ดึงจาก JSON API
     bonds = fetch_bond_list(abbr, session)
-
     if not bonds:
-        logger.info(f"[main] API returned 0 bonds for '{abbr}'")
         return []
-
-    # Step 2: ถ้ามี detail_url และ API ให้ข้อมูลไม่ครบ ดึงเพิ่ม (optional)
     results = []
     for b in bonds[:15]:
         detail_url = b.get("detail_url", "")
-        missing = b.get("coupon_rate", "-") == "-" or b.get("underwriters", "-") == "-"
-
-        if detail_url and missing:
+        if detail_url:
             time.sleep(0.3)
             detail = fetch_bond_detail(detail_url, session)
-            # เติมเฉพาะ field ที่ยังขาด
             for k, v in detail.items():
                 if k not in b or b[k] == "-":
                     b[k] = v
-
         results.append(b)
-
     logger.info(f"[main] Done: {len(results)} bonds")
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FORMAT
-# ─────────────────────────────────────────────────────────────────────────────
-
-def format_bond_message(bonds: list[dict], company_name: str) -> str:
+def format_bond_message(bonds: list, company_name: str) -> str:
     if not bonds:
         return (
             f"❌ ไม่พบข้อมูลหุ้นกู้ของ \"{company_name}\"\n\n"
@@ -221,58 +182,36 @@ def format_bond_message(bonds: list[dict], company_name: str) -> str:
             "  เช่น PTT, CPALL, CI, ASW, KBANK\n\n"
             "📌 ข้อมูลจาก ThaiBMA"
         )
-
-    # แยก short/long term
-    long_bonds  = [b for b in bonds if "Long" in b.get("term_type", "")]
+    long_bonds  = [b for b in bonds if "Long"  in b.get("term_type", "")]
     short_bonds = [b for b in bonds if "Short" in b.get("term_type", "")]
-
     lines = [f"📋 หุ้นกู้ {company_name.upper()} ({len(bonds)} รุ่น)", "─" * 28]
 
-    def add_bonds(bond_list: list[dict], label: str):
+    def add_bonds(bond_list, label):
         if not bond_list:
             return
         lines.append(f"\n{label} ({len(bond_list)} รุ่น)")
         for b in bond_list:
-            sym   = b.get("symbol", "-")
-            issue = b.get("issue_date", "-")
-            mat   = b.get("maturity_date", "-")
-            tenor = b.get("tenor", "-")
-            cpn   = b.get("coupon_rate", "-")
-            out   = b.get("outstanding_size", b.get("issue_size", "-"))
-            sec   = b.get("secured_label", "🔓 ไม่มีหลักประกัน")
-            irat  = b.get("issue_rating", "-")
-            erat  = b.get("issuer_rating", "-")
-            reg   = b.get("registrar", "-")
-            bh    = b.get("bondholder_rep", "-")
-            uw    = b.get("underwriters", "-")
-            dist  = b.get("distribution", "-")
-
             lines.extend([
-                f"\n🔹 {sym}",
-                f"  📅 ออก: {issue}",
-                f"  📅 ครบกำหนด: {mat}",
-                f"  ⏳ อายุ: {tenor}",
-                f"  💰 ดอกเบี้ย: {cpn}",
-                f"  💵 Outstanding: {out}",
-                f"  {sec}",
-                f"  📢 ขายให้: {dist}",
-                f"  📊 Issue Rating: {irat}",
-                f"  📊 Issuer Rating: {erat}",
-                f"  🏦 Registrar: {reg}",
-                f"  👤 BH Rep: {bh}",
-                f"  📢 Underwriter: {uw}",
+                f"\n🔹 {b.get('symbol','-')}",
+                f"  📅 ออก: {b.get('issue_date','-')}",
+                f"  📅 ครบกำหนด: {b.get('maturity_date','-')}",
+                f"  ⏳ อายุ: {b.get('tenor','-')}",
+                f"  💰 ดอกเบี้ย: {b.get('coupon_rate','-')}",
+                f"  💵 Outstanding: {b.get('outstanding_size', b.get('issue_size','-'))} ลบ.",
+                f"  {b.get('secured_label','🔓 ไม่มีหลักประกัน')}",
+                f"  📢 ขายให้: {b.get('distribution','-')}",
+                f"  📊 Issue Rating: {b.get('issue_rating','-')}",
+                f"  📊 Issuer Rating: {b.get('issuer_rating','-')}",
+                f"  🏦 Registrar: {b.get('registrar','-')}",
+                f"  👤 BH Rep: {b.get('bondholder_rep','-')}",
+                f"  📢 UWs: {b.get('underwriters','-')}",
             ])
 
-    add_bonds(long_bonds, "📌 Long Term Debenture")
+    add_bonds(long_bonds,  "📌 Long Term Debenture")
     add_bonds(short_bonds, "📌 Short Term Debenture")
-
-    lines += ["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"]
+    lines.extend(["", "─" * 28, "📌 ข้อมูลจาก ThaiBMA"])
     return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _assign(d: dict, label: str, value: str):
     v = value.strip()
@@ -281,9 +220,9 @@ def _assign(d: dict, label: str, value: str):
     if "symbol" in label and not d.get("symbol"):
         d["symbol"] = v.split()[0]
     elif "issue date" in label and "registration" not in label and not d.get("issue_date"):
-        d["issue_date"] = v
+        d["issue_date"] = fmt_date(v)
     elif "maturity date" in label and not d.get("maturity_date"):
-        d["maturity_date"] = v
+        d["maturity_date"] = fmt_date(v)
     elif "issue term" in label:
         d["tenor"] = v.split("/")[0].strip()
     elif "coupon payment" in label:
