@@ -5,7 +5,6 @@ import requests
 import logging
 import re
 import time
-from bs4 import BeautifulSoup
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -100,6 +99,23 @@ def _decode_str(b):
     except Exception:
         return None
 
+def _dump_proto(data, path="", depth=0):
+    """Dump all values for debugging"""
+    if depth > 4:
+        return []
+    out = []
+    for fnum, wtype, val in _parse_proto(data):
+        p = f"{path}.{fnum}"
+        if wtype in (0, 1, 5):
+            out.append((p, float(val)))
+        elif wtype == 2:
+            s = _decode_str(val)
+            if s:
+                out.append((p, s))
+            if len(val) > 2:
+                out.extend(_dump_proto(val, p, depth+1))
+    return out
+
 # ─── Login ────────────────────────────────────────────────────────────────────
 
 _cached_token = None
@@ -138,135 +154,6 @@ def get_bearer_token(session):
         logger.exception(f"[login] error: {e}")
     return None
 
-
-# ─── Fetch ibond bond page ────────────────────────────────────────────────────
-
-def get_coupon_from_ibond_page(symbol, token, session):
-    """
-    เข้าหน้า ibond.thaibma.or.th/bonds?symbol=PCLV268A
-    แล้ว parse coupon rate ออกจากหน้า HTML หรือ JSON response
-    """
-    url = f"{BASE_IBOND}/bonds?symbol={symbol}"
-    headers = {
-        **HEADERS_BASE,
-        "Accept": "text/html,application/xhtml+xml,application/json,*/*",
-        "Authorization": f"Bearer {token}",
-        "Referer": f"{BASE_IBOND}/bondsearch/bondsearchpage",
-    }
-
-    try:
-        resp = session.get(url, headers=headers, timeout=20)
-        logger.info(f"[ibond_page] {url}: status={resp.status_code}, len={len(resp.text)}, ct={resp.headers.get('Content-Type','')}")
-        logger.info(f"[ibond_page] response preview: {resp.text[:500]}")
-
-        if resp.status_code != 200:
-            return "-"
-
-        ct = resp.headers.get("Content-Type", "")
-
-        # JSON response
-        if "json" in ct:
-            try:
-                data = resp.json()
-                logger.info(f"[ibond_page] json keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
-                coupon = _extract_coupon_from_json(data)
-                if coupon != "-":
-                    return coupon
-            except Exception:
-                pass
-
-        # HTML response — parse ด้วย BeautifulSoup
-        if "html" in ct or resp.text.strip().startswith("<"):
-            soup = BeautifulSoup(resp.text, "lxml")
-            full_text = soup.get_text(separator=" ")
-            logger.info(f"[ibond_page] page text preview: {full_text[:300]}")
-
-            # หา coupon rate pattern ในข้อความ
-            patterns = [
-                r"Coupon\s*(?:Rate|Payment)?[:\s]+(\d+\.?\d*)\s*%",
-                r"Fixed\s*:?\s*(\d+\.?\d*)\s*%?",
-                r"(\d+\.?\d*)\s*%\s*(?:per\s*annum|p\.a\.)",
-                r"อัตราดอกเบี้ย[:\s]+(\d+\.?\d*)",
-            ]
-            for pat in patterns:
-                m = re.search(pat, full_text, re.I)
-                if m:
-                    n = float(m.group(1))
-                    if 0.1 <= n <= 50:
-                        if n < 1: n *= 100
-                        result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                        logger.info(f"[ibond_page] coupon found: {result}")
-                        return result
-
-            # หา JSON ที่ embed ใน script tag
-            for script in soup.find_all("script"):
-                js = script.get_text()
-                if "coupon" in js.lower() or "interest" in js.lower():
-                    m = re.search(r'"(?:coupon|interest|rate)[Rr]ate"\s*:\s*"?([\d.]+)"?', js, re.I)
-                    if m:
-                        n = float(m.group(1))
-                        if 0.1 <= n <= 50:
-                            if n < 1: n *= 100
-                            result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-                            logger.info(f"[ibond_page] coupon from script: {result}")
-                            return result
-
-        # ลอง API endpoint อื่นๆ ของ ibond
-        api_urls = [
-            f"{BASE_IBOND}/api/bonds/{symbol}",
-            f"{BASE_IBOND}/api/bond?symbol={symbol}",
-            f"{BASE_IBOND}/bonddetail?symbol={symbol}",
-        ]
-        for api_url in api_urls:
-            try:
-                r = session.get(api_url, headers=headers, timeout=10)
-                logger.info(f"[ibond_api] {api_url}: status={r.status_code}, len={len(r.text)}")
-                if r.status_code == 200 and len(r.text) > 10:
-                    logger.info(f"[ibond_api] response: {r.text[:200]}")
-                    try:
-                        data = r.json()
-                        coupon = _extract_coupon_from_json(data)
-                        if coupon != "-":
-                            return coupon
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-    except Exception as e:
-        logger.exception(f"[ibond_page] error: {e}")
-
-    return "-"
-
-
-def _extract_coupon_from_json(data):
-    if not data:
-        return "-"
-    items = data if isinstance(data, list) else [data]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in ["couponRate", "CouponRate", "rate", "Rate", "interestRate",
-                    "InterestRate", "fixedRate", "FixedRate", "coupon", "Coupon"]:
-            val = item.get(key)
-            if val is None or str(val).strip() in ["", "null", "None", "0", "0.0", "-"]:
-                continue
-            v = str(val).strip()
-            m = re.search(r"Fixed\s*:?\s*([\d.]+)", v, re.I)
-            if m:
-                n = float(m.group(1))
-                if n < 1: n *= 100
-                return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            try:
-                n = float(v)
-                if 0.1 <= n <= 50:
-                    if n < 1: n *= 100
-                    return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
-            except ValueError:
-                pass
-    return "-"
-
-
 # ─── gRPC call ────────────────────────────────────────────────────────────────
 
 def grpc_call(method, proto_bytes, token, session):
@@ -293,27 +180,105 @@ def grpc_call(method, proto_bytes, token, session):
         logger.warning(f"[grpc] {method}: {e}")
         return []
 
+# ─── Get coupon with UUID ─────────────────────────────────────────────────────
 
-def get_participants(symbol, role, token, session):
+def get_coupon_by_uuid(issue_uuid, symbol, token, session):
+    """
+    ลอง GetCouponPayment ด้วย UUID (IssueID) แทน symbol string
+    """
+    if not issue_uuid or issue_uuid == "-":
+        return "-"
+
+    # ลอง field ต่างๆ: field 1, 2, 3 ด้วย UUID
+    for field_num in [1, 2]:
+        proto  = _proto_string(field_num, issue_uuid)
+        frames = grpc_call("GetCouponPayment", proto, token, session)
+        logger.info(f"[coupon_uuid] field={field_num} uuid={issue_uuid[:20]}: {len(frames)} frames")
+
+        for frame in frames:
+            all_vals = _dump_proto(frame)
+            logger.info(f"[coupon_uuid] f={field_num} vals: {str(all_vals)[:300]}")
+
+            for path, val in all_vals:
+                if isinstance(val, (int, float)):
+                    n = float(val)
+                    # coupon rate ของ PCLV คือ 7.5 — หาค่าที่อยู่ระหว่าง 0.5-30
+                    if 0.5 <= n <= 30:
+                        if n < 1: n *= 100
+                        result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                        logger.info(f"[coupon_uuid] candidate {path}={n} → {result}")
+                        return result
+                elif isinstance(val, str):
+                    m = re.search(r"\b(\d+\.?\d*)\s*%", val)
+                    if m:
+                        try:
+                            n = float(m.group(1))
+                            if 0.5 <= n <= 30:
+                                result = f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+                                logger.info(f"[coupon_uuid] str {path}={val[:30]} → {result}")
+                                return result
+                        except Exception:
+                            pass
+
+    # ลอง GetBondDetail หรือ API อื่น
+    for method in ["GetBondDetail", "GetBondInfo", "GetBondFeature", "GetIssuerBond"]:
+        proto  = _proto_string(1, issue_uuid)
+        frames = grpc_call(method, proto, token, session)
+        if frames:
+            logger.info(f"[coupon_uuid] {method} returned {len(frames)} frames!")
+            for frame in frames:
+                all_vals = _dump_proto(frame)
+                logger.info(f"[coupon_uuid] {method} vals: {str(all_vals)[:300]}")
+                for path, val in all_vals:
+                    if isinstance(val, (int, float)):
+                        n = float(val)
+                        if 0.5 <= n <= 30:
+                            if n < 1: n *= 100
+                            return f"{n:.4f}".rstrip("0").rstrip(".") + "%"
+
+    return "-"
+
+# ─── Get participants with UUID ───────────────────────────────────────────────
+
+def get_participants_by_uuid(issue_uuid, symbol, role, token, session):
+    """ลอง GetParticipants ด้วย UUID"""
+    results_found = []
+
+    # ลอง UUID ก่อน
+    for field_num in [1, 2]:
+        proto  = _proto_string(field_num, issue_uuid)
+        frames = grpc_call("GetParticipants", proto, token, session)
+        logger.info(f"[participant_uuid] {role} field={field_num}: {len(frames)} frames, len={sum(len(f) for f in frames)}")
+        names = _extract_names_from_frames(frames)
+        if names:
+            logger.info(f"[participant_uuid] {role} found: {names}")
+            return " / ".join(names)
+
+    # ลอง UUID + role
+    proto  = _proto_string(1, issue_uuid) + _proto_string(2, role)
+    frames = grpc_call("GetParticipants", proto, token, session)
+    names = _extract_names_from_frames(frames)
+    if names:
+        return " / ".join(names)
+
+    # ลอง symbol string เดิม
     proto  = _proto_string(1, symbol) + _proto_string(2, role)
     frames = grpc_call("GetParticipants", proto, token, session)
-    names  = []
-    for frame in frames:
-        for fnum, wtype, val in _parse_proto(frame):
-            if wtype == 2:
-                s = _decode_str(val)
-                if s and len(s) > 3 and s not in names:
-                    names.append(s)
-                elif not s:
-                    for sf, sw, sv in _parse_proto(val):
-                        if sw == 2:
-                            ss = _decode_str(sv)
-                            if ss and len(ss) > 3 and ss not in names:
-                                names.append(ss)
-    result = " / ".join(names) if names else "-"
-    logger.info(f"[participant] {role}: {result[:80]}")
-    return result
+    names = _extract_names_from_frames(frames)
+    if names:
+        return " / ".join(names)
 
+    return "-"
+
+def _extract_names_from_frames(frames):
+    names = []
+    for frame in frames:
+        all_vals = _dump_proto(frame)
+        for path, val in all_vals:
+            if isinstance(val, str) and len(val) > 5:
+                if not any(x in val.lower() for x in ["uuid", "-", "0000"]) and val not in names:
+                    names.append(val)
+    return names
 
 # ─── REST helpers ─────────────────────────────────────────────────────────────
 
@@ -345,7 +310,6 @@ def fmt_number(raw):
         return f"{int(n):,}" if n == int(n) else f"{n:,.2f}"
     except Exception:
         return raw
-
 
 # ─── Bond List ────────────────────────────────────────────────────────────────
 
@@ -386,6 +350,8 @@ def _item_to_bond(item, term_type):
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
     return {
         "symbol":           symbol,
+        "issue_id":         g("IssueID", "issueId"),
+        "issuer_id":        g("IssuerID", "issuerId"),
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
         "issue_date":       fmt_date(g("IssuedDate", "IssueDate")),
         "maturity_date":    fmt_date(g("MaturityDate", "maturityDate")),
@@ -403,7 +369,6 @@ def _item_to_bond(item, term_type):
         "isin":             g("IssueLegacyID", "isinCode"),
     }
 
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def search_bonds_by_company(company_name):
@@ -418,28 +383,30 @@ def search_bonds_by_company(company_name):
         return []
 
     for b in bonds[:15]:
-        symbol = b.get("symbol", "")
+        symbol   = b.get("symbol", "")
+        issue_id = b.get("issue_id", "-")
+        logger.info(f"[main] {symbol}: issue_id={issue_id}")
+
         if not symbol or not token:
             continue
 
         time.sleep(0.3)
-        coupon = get_coupon_from_ibond_page(symbol, token, session)
+        coupon = get_coupon_by_uuid(issue_id, symbol, token, session)
         if coupon != "-":
             b["coupon_rate"] = coupon
 
         time.sleep(0.2)
-        uw = get_participants(symbol, "UDW", token, session)
+        uw = get_participants_by_uuid(issue_id, symbol, "UDW", token, session)
         if uw != "-":
             b["underwriters"] = uw
 
         time.sleep(0.2)
-        rept = get_participants(symbol, "REPT", token, session)
+        rept = get_participants_by_uuid(issue_id, symbol, "REPT", token, session)
         if rept != "-":
             b["bondholder_rep"] = rept
 
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
-
 
 # ─── FORMAT ───────────────────────────────────────────────────────────────────
 
