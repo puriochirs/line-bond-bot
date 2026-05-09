@@ -72,7 +72,7 @@ def reply_messages(reply_token: str, chunks: list):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
-    logger.info(f"[reply] {len(messages)} msg(s), chars: {[len(c) for c in messages]}")
+    logger.info(f"[reply] {len(messages)} msg(s), chars: {[len(c['text']) for c in messages]}")
     try:
         resp = requests.post(LINE_REPLY_URL, headers=headers, json=payload, timeout=15)
         logger.info(f"[reply] LINE API status: {resp.status_code}")
