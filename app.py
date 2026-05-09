@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-LINE_CHANNEL_SECRET      = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_REPLY_URL           = "https://api.line.me/v2/bot/message/reply"
+LINE_REPLY_URL            = "https://api.line.me/v2/bot/message/reply"
 
 HELP_TEXT = (
     "🤖 Bond Info Bot\n\n"
@@ -34,19 +34,43 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def split_message(text: str, max_len: int = 4900) -> list:
+    """
+    แบ่งข้อความให้แต่ละ chunk ไม่เกิน max_len chars
+    พยายามตัดที่ bond boundary (บรรทัดที่ขึ้นต้นด้วย 🔹) ไม่ใช่กลางบรรทัด
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    lines  = text.split("\n")
+    current = ""
+
+    for line in lines:
+        # ถ้าใส่บรรทัดนี้แล้วจะเกิน limit → flush chunk ก่อน
+        test = current + "\n" + line if current else line
+        if len(test) > max_len and current:
+            chunks.append(current.rstrip())
+            current = line
+        else:
+            current = test
+
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    return chunks
+
+
 def reply_text(reply_token: str, text: str):
-    """ส่ง text reply กลับไปยัง LINE พร้อม logging ละเอียด"""
+    """ส่ง text reply กลับไปยัง LINE (รองรับข้อความยาวสูงสุด 5 messages)"""
     if not text:
-        logger.error("[reply] text is empty, skipping")
         return
 
-    # LINE จำกัด 5 messages ต่อ reply, แต่ละ message ไม่เกิน 5000 chars
-    messages = []
-    remaining = text
-    while remaining and len(messages) < 5:
-        chunk = remaining[:4990]
-        remaining = remaining[4990:]
-        messages.append({"type": "text", "text": chunk})
+    chunks = split_message(text)
+    # LINE รองรับสูงสุด 5 messages ต่อ reply
+    chunks = chunks[:5]
+
+    messages = [{"type": "text", "text": c} for c in chunks]
 
     payload = {"replyToken": reply_token, "messages": messages}
     headers = {
@@ -65,7 +89,7 @@ def reply_text(reply_token: str, text: str):
         else:
             logger.info(f"[reply] LINE API success: {resp.text[:100]}")
     except Exception as e:
-        logger.exception(f"[reply] Exception sending to LINE: {e}")
+        logger.exception(f"[reply] Exception: {e}")
 
 
 def handle_message(event: dict):
@@ -82,9 +106,6 @@ def handle_message(event: dict):
     if user_text.lower() in ["help", "ช่วยเหลือ", "วิธีใช้", "?"]:
         reply_text(reply_token, HELP_TEXT)
         return
-
-    # แจ้งว่ากำลังค้นหา (ส่งก่อนเลย เพราะอาจใช้เวลา)
-    # ไม่สามารถส่ง 2 replies ด้วย same token ได้ จึงทำในครั้งเดียว
 
     try:
         bonds = search_bonds_by_company(user_text)
