@@ -20,6 +20,9 @@ REGISSUE_URL  = f"{BASE_URL}/issuer/regissue"
 BOND_INFO_URL = f"{BASE_URL}/EN/BondInfo/BondFeature/Issue.aspx"
 ISSUER_DETAIL = f"{BASE_URL}/EN/Issuer/IssuerDetail.aspx"
 
+# คำที่ไม่ควรอยู่ใน UWs (garbage values จาก API)
+UW_BLACKLIST = ["financial advisor", "remark", "note", "หมายเหตุ", "-"]
+
 
 def fmt_date(raw: str) -> str:
     if not raw or raw in ["-", "null", "None"]:
@@ -43,6 +46,14 @@ def fmt_number(raw: str) -> str:
         return f"{n:,.2f}"
     except Exception:
         return raw
+
+
+def is_valid_uw(val: str) -> bool:
+    """ตรวจสอบว่า val เป็น underwriter จริงๆ ไม่ใช่ garbage"""
+    if not val or val == "-":
+        return False
+    v_lower = val.lower()
+    return not any(b in v_lower for b in UW_BLACKLIST)
 
 
 # ─── STEP 1: Bond List from JSON API ─────────────────────────────────────────
@@ -92,6 +103,10 @@ def _item_to_bond(item: dict, term_type: str):
     secure_code = g("SecureCode", "securedType", "SecuredType")
     secured_label = "🔒 มีหลักประกัน" if (secure_code != "-" and "unsecure" not in secure_code.lower()) else "🔓 ไม่มีหลักประกัน"
 
+    # UWs จาก API — กรองก่อน ถ้า garbage ให้เป็น "-" แล้วจะดึงจาก detail page
+    api_uw = g("Underwriter", "underwriter")
+    uw_value = api_uw if is_valid_uw(api_uw) else "-"
+
     bond = {
         "symbol":           symbol,
         "term_type":        "Long Term" if term_type == "long" else "Short Term",
@@ -105,7 +120,7 @@ def _item_to_bond(item: dict, term_type: str):
         "secured_label":    secured_label,
         "registrar":        g("Registrar", "registrar"),
         "bondholder_rep":   g("BondholderRepresentative", "bondholderRep"),
-        "underwriters":     g("Underwriter", "underwriter"),
+        "underwriters":     uw_value,
         "issue_rating":     g("IssueRating", "issueRating"),
         "issuer_rating":    g("CompanyRating", "issuerRating"),
         "distribution":     g("DistributionDisplay", "distribution"),
@@ -129,50 +144,54 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
         logger.info(f"[detail] GET {detail_url}")
         resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
         resp.raise_for_status()
-        raw_html = resp.text  # raw HTML string
+        raw_html = resp.text
         soup = BeautifulSoup(raw_html, "lxml")
 
-        # ── 1. Coupon Rate: ค้นใน raw HTML โดยตรง ──────────────────────────
-        # pattern: Fixed: 7.5% หรือ Fixed:7.5% หรือ Fixed : 7.5%
-        m = re.search(r"Fixed\s*:?\s*([\d]+\.?[\d]*)\s*%", raw_html, re.I)
-        if m:
-            detail["coupon_rate"] = m.group(1) + "%"
-            logger.info(f"[detail] coupon: {detail['coupon_rate']}")
-        else:
-            # FRN / Floating rate
-            m2 = re.search(r"\b(FRN|Floating Rate|TBR[\s+\-][\d.]+|MLR[\s+\-][\d.]+|MOR[\s+\-][\d.]+)\b", raw_html, re.I)
-            if m2:
-                detail["coupon_rate"] = m2.group(1).strip()
-                logger.info(f"[detail] coupon FRN: {detail['coupon_rate']}")
+        # ── 1. Coupon Rate ───────────────────────────────────────────────────
+        # ดึง section หลัง "Coupon Payment" เท่านั้น เพื่อป้องกันการ match ผิด
+        coupon_idx = raw_html.lower().find("coupon payment")
+        if coupon_idx >= 0:
+            # หา "Fixed: X.X%" ในส่วนหลัง "Coupon Payment" (400 chars)
+            coupon_section = raw_html[coupon_idx: coupon_idx + 400]
+            m = re.search(r"Fixed\s*:?\s*([\d]+\.?[\d]*)\s*%", coupon_section, re.I)
+            if m:
+                detail["coupon_rate"] = m.group(1) + "%"
+                logger.info(f"[detail] coupon fixed: {detail['coupon_rate']}")
             else:
-                # log snippet รอบคำว่า coupon เพื่อ debug
-                idx = raw_html.lower().find("coupon")
-                snippet = raw_html[max(0,idx-20):idx+150] if idx >= 0 else "not found"
-                logger.info(f"[detail] coupon NOT found. snippet: {snippet[:120]}")
+                # FRN / Floating
+                m2 = re.search(r"\b(FRN)\b|(Floating\s*Rate)|(TBR|MLR|MOR)\s*[+\-]\s*[\d.]+", coupon_section, re.I)
+                if m2:
+                    detail["coupon_rate"] = m2.group(0).strip()
+                    logger.info(f"[detail] coupon FRN: {detail['coupon_rate']}")
+                else:
+                    logger.info(f"[detail] coupon not found. section: {coupon_section[:100]}")
+        else:
+            logger.info(f"[detail] 'Coupon Payment' not found in HTML")
 
-        # ── 2. Underwriter: parse table หา row ที่มี "Underwriter" ──────────
+        # ── 2. Underwriter ───────────────────────────────────────────────────
         for table in soup.find_all("table"):
+            found = False
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
                 if not cells:
                     continue
-                first = cells[0].get_text(strip=True)
-                first_lower = first.lower()
-
+                first_lower = cells[0].get_text(strip=True).lower()
                 if "underwriter" in first_lower:
-                    # Row structure: [Underwriter(s)] [value] [Financial Advisor(s)] [-]
-                    # เอาแค่ cell[1] ซึ่งเป็น underwriter value จริงๆ
+                    # เอาแค่ cell[1] = value จริงๆ
                     if len(cells) >= 2:
                         uw_val = cells[1].get_text(strip=True)
-                        if uw_val and uw_val not in ["-", ""]:
+                        if is_valid_uw(uw_val):
                             detail["underwriters"] = uw_val
-                            logger.info(f"[detail] underwriters: {uw_val[:60]}")
+                            logger.info(f"[detail] UW: {uw_val[:60]}")
+                    found = True
                     break
+            if found:
+                break
 
         # ── 3. Secured Label ─────────────────────────────────────────────────
-        if "[ Senior ][ Unsecured ]" in raw_html or "Unsecured" in raw_html:
+        if "[ Senior ][ Unsecured ]" in raw_html:
             detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
-        elif "[ Senior ][ Secured ]" in raw_html or "Secured" in raw_html:
+        elif "[ Senior ][ Secured ]" in raw_html or "[ Secured ]" in raw_html:
             detail["secured_label"] = "🔒 มีหลักประกัน"
 
     except Exception as e:
