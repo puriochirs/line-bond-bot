@@ -1,5 +1,6 @@
 """
-SEC Filing Scraper — ใช้ GetViewFiling ค้นหาด้วยชื่อบริษัทโดยตรง
+SEC Filing Scraper — market.sec.or.th
+ค้นหา bond offerings ที่กำลังขาย/จะขาย
 """
 import requests
 import logging
@@ -9,8 +10,8 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-SEC_BASE    = "https://market.sec.or.th/public/idisc"
-FILING_URL  = f"{SEC_BASE}/api/product/GetViewFiling"
+SEC_BASE   = "https://market.sec.or.th/public/idisc"
+FILING_URL = f"{SEC_BASE}/api/product/GetViewFiling"
 
 SEC_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -49,71 +50,81 @@ def shorten_bond_name(name: str) -> str:
     return name[:60]
 
 
+def _call_filing_api(search_symbol: str, search_company: str, session: requests.Session) -> str:
+    """เรียก GetViewFiling API และ return HTML content"""
+    payload = {
+        "UniqueIdReference": "",
+        "SearchCompany":     search_company,
+        "SearchSymbol":      search_symbol,
+        "SecuTypeCode":      "ALL",  # ALL เพื่อให้ได้ผลมากที่สุด แล้ว filter เฉพาะตราสารหนี้
+        "OfferType":         None,
+        "OfferTypeCode":     None,
+        "ProjType":          None,
+        "ProjRetailType":    None,
+        "MarketTypeCode":    "",
+        "OfferDateFrom":     "",
+        "OfferDateto":       "",
+        "EfftDateFrom":      "",
+        "EfftDateTo":        "",
+        "DbenEfftDateFrom":  "",
+        "DbenEfftDateTo":    "",
+        "DbenFlag":          "",
+        "CountDateFrom":     "",
+        "CountDateTo":       "",
+        "FundAbbrName":      "",
+        "FilingData":        0,
+        "PolicyCode":        None,
+        "SpecCode":          None,
+        "Gain":              None,
+        "InvestCountryFlag": None,
+        "Lang":              "th",
+    }
+    resp = session.post(FILING_URL, json=payload, headers=SEC_HEADERS, timeout=25)
+    logger.info(f"[sec] symbol={search_symbol!r} company={search_company!r}: "
+                f"status={resp.status_code}, len={len(resp.text)}")
+    if resp.status_code != 200:
+        return ""
+    data    = resp.json()
+    content = data.get("content", "") or ""
+    logger.info(f"[sec] content len={len(content)}")
+    return content
+
+
 def search_sec_offerings(abbr: str) -> list:
-    """ค้นหา bond offerings จาก SEC โดยใช้ SearchSymbol"""
+    """
+    ค้นหา bond offerings จาก SEC
+    ลองหลาย search strategy เพื่อให้เจอ
+    """
     session = requests.Session()
+    abbr_up = abbr.strip().upper()
 
-    # ลองค้นด้วย SearchSymbol ก่อน (ชื่อย่อ เช่น CI, SIRI)
-    for search_field, search_val in [
-        ("SearchSymbol", abbr.upper()),
-        ("SearchCompany", abbr.upper()),
-    ]:
-        payload = {
-            "UniqueIdReference": "",
-            "SearchCompany": search_val if search_field == "SearchCompany" else "",
-            "SearchSymbol":  search_val if search_field == "SearchSymbol"  else "",
-            "SecuTypeCode": "PL",      # PL = หุ้นกู้ที่ขออนุญาต
-            "OfferType": None,
-            "OfferTypeCode": None,
-            "ProjType": None,
-            "ProjRetailType": None,
-            "MarketTypeCode": "",
-            "OfferDateFrom": "",
-            "OfferDateto": "",
-            "EfftDateFrom": "",
-            "EfftDateTo": "",
-            "DbenEfftDateFrom": "",
-            "DbenEfftDateTo": "",
-            "DbenFlag": "",
-            "CountDateFrom": "",
-            "CountDateTo": "",
-            "FundAbbrName": "",
-            "FilingData": 0,
-            "PolicyCode": None,
-            "SpecCode": None,
-            "Gain": None,
-            "InvestCountryFlag": None,
-            "Lang": "th",
-        }
+    # ลองหลาย strategy
+    strategies = [
+        (abbr_up, ""),           # SearchSymbol = abbr
+        ("", abbr_up),           # SearchCompany = abbr
+    ]
 
+    for sym, comp in strategies:
         try:
-            resp = session.post(FILING_URL, json=payload, headers=SEC_HEADERS, timeout=20)
-            logger.info(f"[sec] {search_field}={search_val}: status={resp.status_code}, len={len(resp.text)}")
-
-            if resp.status_code != 200:
-                continue
-
-            data = resp.json()
-            content = data.get("content", "") or ""
-            logger.info(f"[sec] content len={len(content)}")
-
+            content = _call_filing_api(sym, comp, session)
             if not content or len(content) < 100:
                 continue
-
             results = parse_debenture_table(content)
-            logger.info(f"[sec] found {len(results)} active/upcoming offerings")
+            logger.info(f"[sec] strategy sym={sym!r} comp={comp!r}: "
+                        f"found {len(results)} active/upcoming")
             if results:
                 return results
-
         except Exception as e:
-            logger.warning(f"[sec] {search_field} error: {e}")
+            logger.warning(f"[sec] strategy error sym={sym!r} comp={comp!r}: {e}")
+            continue
 
     return []
 
 
 def parse_debenture_table(html: str) -> list:
-    soup   = BeautifulSoup(html, "lxml")
-    today  = date.today()
+    """Parse ตารางตราสารหนี้จาก HTML พร้อม log วันที่ทุก row เพื่อ debug"""
+    soup    = BeautifulSoup(html, "lxml")
+    today   = date.today()
     results = []
 
     # หาตาราง ตราสารหนี้
@@ -127,11 +138,11 @@ def parse_debenture_table(html: str) -> list:
                     break
 
     if not table:
-        logger.info("[sec] no debenture table in HTML")
+        logger.info("[sec] no debenture table found")
         return []
 
     rows = table.find_all("tr")[1:]
-    logger.info(f"[sec] rows={len(rows)}")
+    logger.info(f"[sec] debenture rows={len(rows)}")
 
     for row in rows:
         cols = [c.get_text(strip=True) for c in row.find_all("td")]
@@ -147,6 +158,8 @@ def parse_debenture_table(html: str) -> list:
 
         start_date = thai_to_date(start_raw)
         end_date   = thai_to_date(end_raw)
+
+        logger.info(f"[sec] row: start={start_raw}({start_date}) end={end_raw}({end_date}) today={today}")
 
         # กรองที่หมดอายุแล้วออก
         if end_date and end_date < today:
