@@ -113,14 +113,13 @@ def _item_to_bond(item: dict, term_type: str):
     }
 
     issue_id = g("IssueID", "issueId", "id", "Id")
-    logger.info(f"[item] {symbol}: IssueID={issue_id}")
     if issue_id != "-":
         bond["detail_url"] = f"{BOND_INFO_URL}?symbol={issue_id}"
 
     return bond
 
 
-# ─── STEP 2: Bond Detail — regex on full page text ───────────────────────────
+# ─── STEP 2: Bond Detail ─────────────────────────────────────────────────────
 
 def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
     detail = {}
@@ -129,71 +128,51 @@ def fetch_bond_detail(detail_url: str, session: requests.Session) -> dict:
     try:
         logger.info(f"[detail] GET {detail_url}")
         resp = session.get(detail_url, headers={**HEADERS, "Accept": "text/html,*/*"}, timeout=20)
-        logger.info(f"[detail] status={resp.status_code} len={len(resp.text)}")
         resp.raise_for_status()
+        raw_html = resp.text  # raw HTML string
+        soup = BeautifulSoup(raw_html, "lxml")
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        # ดึง text ทั้งหน้าสำหรับ regex
-        full_text = soup.get_text(separator="\n")
-
-        # ── Coupon Rate: หา "Fixed: X.X%" ในข้อความทั้งหน้า ──
-        m = re.search(r"Fixed[:\s]+([\d.]+)\s*%", full_text, re.I)
+        # ── 1. Coupon Rate: ค้นใน raw HTML โดยตรง ──────────────────────────
+        # pattern: Fixed: 7.5% หรือ Fixed:7.5% หรือ Fixed : 7.5%
+        m = re.search(r"Fixed\s*:?\s*([\d]+\.?[\d]*)\s*%", raw_html, re.I)
         if m:
             detail["coupon_rate"] = m.group(1) + "%"
-            logger.info(f"[detail] coupon found: {detail['coupon_rate']}")
+            logger.info(f"[detail] coupon: {detail['coupon_rate']}")
         else:
-            # FRN/Floating
-            m2 = re.search(r"(FRN|Floating|TBR[+-][\d.]+|MLR[+-][\d.]+|MOR[+-][\d.]+)", full_text, re.I)
+            # FRN / Floating rate
+            m2 = re.search(r"\b(FRN|Floating Rate|TBR[\s+\-][\d.]+|MLR[\s+\-][\d.]+|MOR[\s+\-][\d.]+)\b", raw_html, re.I)
             if m2:
-                detail["coupon_rate"] = m2.group(1)
+                detail["coupon_rate"] = m2.group(1).strip()
                 logger.info(f"[detail] coupon FRN: {detail['coupon_rate']}")
             else:
-                logger.info(f"[detail] coupon NOT found. Snippet: {full_text[full_text.lower().find('coupon')-20:full_text.lower().find('coupon')+80] if 'coupon' in full_text.lower() else 'no coupon keyword'}")
+                # log snippet รอบคำว่า coupon เพื่อ debug
+                idx = raw_html.lower().find("coupon")
+                snippet = raw_html[max(0,idx-20):idx+150] if idx >= 0 else "not found"
+                logger.info(f"[detail] coupon NOT found. snippet: {snippet[:120]}")
 
-        # ── Underwriter(s): ดึงจาก table parser ──
-        uw_list = []
+        # ── 2. Underwriter: parse table หา row ที่มี "Underwriter" ──────────
         for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            in_uw_section = False
-            for row in rows:
+            for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
                 if not cells:
                     continue
-                first = cells[0].get_text(strip=True).lower()
-                row_text = " ".join(c.get_text(strip=True) for c in cells)
+                first = cells[0].get_text(strip=True)
+                first_lower = first.lower()
 
-                # เจอ header "Underwriter"
-                if "underwriter" in first:
-                    in_uw_section = True
-                    # value อาจอยู่ใน cell ถัดไปในแถวเดียวกัน
-                    for c in cells[1:]:
-                        v = c.get_text(strip=True)
-                        if v and v not in uw_list and len(v) > 3:
-                            uw_list.append(v)
-                    continue
+                if "underwriter" in first_lower:
+                    # Row structure: [Underwriter(s)] [value] [Financial Advisor(s)] [-]
+                    # เอาแค่ cell[1] ซึ่งเป็น underwriter value จริงๆ
+                    if len(cells) >= 2:
+                        uw_val = cells[1].get_text(strip=True)
+                        if uw_val and uw_val not in ["-", ""]:
+                            detail["underwriters"] = uw_val
+                            logger.info(f"[detail] underwriters: {uw_val[:60]}")
+                    break
 
-                # ถ้าอยู่ใน section underwriter และยังไม่เจอ section อื่น
-                if in_uw_section:
-                    # ถ้าเจอ label อื่น ออกจาก section
-                    if first and any(k in first for k in ["financial", "registrar", "bondholder", "guarantor", "rating", "symbol", "issuer", "distribution"]):
-                        in_uw_section = False
-                        continue
-                    # เก็บทุก cell ที่ไม่ว่าง
-                    for c in cells:
-                        v = c.get_text(strip=True)
-                        if v and v not in uw_list and len(v) > 3:
-                            uw_list.append(v)
-
-        if uw_list:
-            detail["underwriters"] = " / ".join(uw_list)
-            logger.info(f"[detail] underwriters: {detail['underwriters'][:80]}")
-        else:
-            logger.info(f"[detail] underwriters NOT found")
-
-        # ── Secured Label ──
-        if "unsecured" in full_text.lower() or "unsecure" in full_text.lower():
+        # ── 3. Secured Label ─────────────────────────────────────────────────
+        if "[ Senior ][ Unsecured ]" in raw_html or "Unsecured" in raw_html:
             detail["secured_label"] = "🔓 ไม่มีหลักประกัน"
-        elif any(k in full_text for k in ["Secured", "FASSET"]):
+        elif "[ Senior ][ Secured ]" in raw_html or "Secured" in raw_html:
             detail["secured_label"] = "🔒 มีหลักประกัน"
 
     except Exception as e:
