@@ -2,7 +2,6 @@
 SEC Filing Scraper — market.sec.or.th
 ค้นหา bond offerings ที่กำลังขาย/จะขาย + ดึง coupon rate จาก PDF Fact Sheet
 """
-import io
 import re
 import logging
 import requests
@@ -57,104 +56,7 @@ def shorten_bond_name(name: str) -> str:
     return m.group(1)[:60] if m else name[:60]
 
 
-# ─── PDF coupon extraction ─────────────────────────────────────────────────────
-
-def extract_coupon_from_pdf_url(pdf_url: str, session: requests.Session) -> str:
-    """Download PDF และ parse หา coupon rate — คืน '-' ถ้าไม่เจอ"""
-    try:
-        logger.info(f"[pdf] downloading: {pdf_url}")
-        resp = session.get(pdf_url, headers=HTML_HEADERS, timeout=60, stream=True)
-        if resp.status_code != 200:
-            return "-"
-
-        # อ่านแค่ 500KB แรก (ข้อมูลส่วนใหญ่อยู่ด้านต้น)
-        pdf_bytes = b""
-        for chunk in resp.iter_content(chunk_size=65536):
-            pdf_bytes += chunk
-            if len(pdf_bytes) > 200_000:
-                break
-
-        return parse_coupon_from_pdf_bytes(pdf_bytes)
-
-    except Exception as e:
-        logger.warning(f"[pdf] download error: {e}")
-        return "-"
-
-
-def parse_coupon_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Parse PDF bytes หา coupon rate"""
-    try:
-        from pdfminer.high_level import extract_text
-        text = extract_text(io.BytesIO(pdf_bytes))
-    except Exception as e:
-        logger.warning(f"[pdf] pdfminer error: {e}")
-        return "-"
-
-    if not text:
-        return "-"
-
-    logger.info(f"[pdf] extracted {len(text)} chars")
-
-    # pattern ที่พบบ่อยใน Fact Sheet ไทย
-    patterns = [
-        r"อัตราดอกเบี้ย[^\d]*([\d]+\.[\d]+)\s*%?\s*ต่อปี",
-        r"อัตราดอกเบี้ยคงที่[^\d]*([\d]+\.[\d]+)\s*%",
-        r"Fixed\s*(?:Rate)?\s*[:\s]*([\d]+\.[\d]+)\s*%",
-        r"Coupon\s*Rate\s*[:\s]*([\d]+\.[\d]+)\s*%",
-        r"Interest\s*Rate\s*[:\s]*([\d]+\.[\d]+)\s*%",
-        r"ดอกเบี้ย\s*([\d]+\.[\d]+)\s*%\s*ต่อปี",
-        r"([\d]+\.[\d]+)\s*%\s*(?:per\s*annum|ต่อปี)",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if m:
-            try:
-                n = float(m.group(1))
-                if 0.1 <= n <= 30:
-                    logger.info(f"[pdf] coupon found: {n}%")
-                    return f"{n:.2f}%".rstrip('0').rstrip('.')  + "%"
-            except Exception:
-                pass
-
-    logger.info(f"[pdf] coupon not found in PDF")
-    return "-"
-
-
-def get_pdf_link_from_filing_page(filing_url: str, session: requests.Session) -> str:
-    """เข้าหน้า filing → หา PDF link ที่เป็น Fact Sheet / Prospectus"""
-    try:
-        resp = session.get(filing_url, headers=HTML_HEADERS, timeout=60)
-        if resp.status_code != 200:
-            return ""
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # หา link ที่ชี้ไปยัง PDF
-        pdf_keywords = ["fact", "prospectus", "หนังสือชี้ชวน", "term", "factsheet"]
-        for a in soup.find_all("a", href=True):
-            href  = a["href"]
-            text  = a.get_text(strip=True).lower()
-            href_l = href.lower()
-            if ".pdf" in href_l or any(k in text for k in pdf_keywords) or any(k in href_l for k in pdf_keywords):
-                if href.startswith("http"):
-                    return href
-                elif href.startswith("/"):
-                    return "https://market.sec.or.th" + href
-                else:
-                    return href
-
-        # Fallback: หา link ทั้งหมดที่มี .pdf
-        for a in soup.find_all("a", href=True):
-            if ".pdf" in a["href"].lower():
-                href = a["href"]
-                if href.startswith("http"):
-                    return href
-                elif href.startswith("/"):
-                    return "https://market.sec.or.th" + href
-
-    except Exception as e:
-        logger.warning(f"[pdf] filing page error: {e}")
-    return ""
+# ─── (PDF parsing removed — ใช้ link แทน) ────────────────────────────────────
 
 
 # ─── SEC API ──────────────────────────────────────────────────────────────────
@@ -211,8 +113,7 @@ def search_sec_offerings(abbr: str) -> list:
     return parse_debenture_table(content, soup, session)
 
 
-def parse_debenture_table(html: str, soup: BeautifulSoup,
-                          session: requests.Session) -> list:
+def parse_debenture_table(html: str, soup: BeautifulSoup, session=None) -> list:
     today   = date.today()
     results = []
 
@@ -256,28 +157,15 @@ def parse_debenture_table(html: str, soup: BeautifulSoup,
 
         status = "upcoming" if (start_date and start_date > today) else "active"
 
-        # ดึง filing link จากแถวนั้น → ไปหา PDF
+        # ดึง filing link จากแถวนั้น
         filing_link = ""
-        coupon_rate = "-"
         last_td = tds[-1] if tds else None
         if last_td:
             a = last_td.find("a", href=True)
             if a:
                 filing_link = a["href"]
-                if not filing_link.startswith("http"):
+                if filing_link and not filing_link.startswith("http"):
                     filing_link = "https://market.sec.or.th" + filing_link
-
-        if filing_link:
-            logger.info(f"[sec] filing link: {filing_link}")
-            # ลอง parse PDF แบบ best-effort ถ้า timeout ก็ข้ามไป
-            try:
-                pdf_url = get_pdf_link_from_filing_page(filing_link, session)
-                if pdf_url:
-                    coupon_rate = extract_coupon_from_pdf_url(pdf_url, session)
-                else:
-                    logger.info(f"[sec] no PDF found")
-            except Exception as pdf_err:
-                logger.warning(f"[sec] PDF skip: {pdf_err}")
 
         results.append({
             "bond_name":   shorten_bond_name(bond_name),
@@ -286,7 +174,7 @@ def parse_debenture_table(html: str, soup: BeautifulSoup,
             "start_date":  fmt_date(start_date),
             "end_date":    fmt_date(end_date),
             "condition":   condition[:40] if condition else "",
-            "coupon_rate": coupon_rate,
+            "filing_link": filing_link,
             "status":      status,
         })
 
@@ -302,14 +190,13 @@ def format_sec_section(offerings: list) -> str:
         icon  = "🟢" if o["status"] == "active" else "🔜"
         label = "กำลังขายอยู่" if o["status"] == "active" else "เร็วๆ นี้"
         cond  = f"\n  ⚠️ {o['condition']}" if o["condition"] else ""
-        cpn   = o.get("coupon_rate", "-")
+        link  = f"\n  🔗 {o['filing_link']}" if o.get("filing_link") else ""
         lines.extend([
             f"\n{icon} {label}",
             f"  📄 {o['bond_name']}",
-            f"  💰 ดอกเบี้ย: {cpn}",
             f"  💵 วงเงิน: {o['amount_mln']} ลบ.",
             f"  📢 เสนอขายให้: {o['dist_type']}",
-            f"  📅 {o['start_date']} → {o['end_date']}{cond}",
+            f"  📅 {o['start_date']} → {o['end_date']}{cond}{link}",
         ])
 
     return "\n".join(lines)
