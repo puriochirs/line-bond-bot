@@ -34,10 +34,10 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def split_message(text: str, max_len: int = 4900) -> list:
+def split_message(text: str, max_len: int = 4800) -> list:
     """
     แบ่งข้อความให้แต่ละ chunk ไม่เกิน max_len chars
-    พยายามตัดที่ bond boundary (บรรทัดที่ขึ้นต้นด้วย 🔹) ไม่ใช่กลางบรรทัด
+    พยายามตัดที่ bond boundary (🔹) ไม่ใช่กลางบรรทัด
     """
     if len(text) <= max_len:
         return [text]
@@ -47,18 +47,27 @@ def split_message(text: str, max_len: int = 4900) -> list:
     current = ""
 
     for line in lines:
-        # ถ้าใส่บรรทัดนี้แล้วจะเกิน limit → flush chunk ก่อน
-        test = current + "\n" + line if current else line
-        if len(test) > max_len and current:
-            chunks.append(current.rstrip())
-            current = line
+        addition = ("\n" + line) if current else line
+        if len(current) + len(addition) > max_len:
+            if current:
+                chunks.append(current.rstrip())
+            # ถ้า line เดียวยาวเกิน ตัดทิ้ง
+            current = line[:max_len]
         else:
-            current = test
+            current += addition
 
     if current.strip():
         chunks.append(current.rstrip())
 
-    return chunks
+    # ตรวจสอบอีกครั้งว่าทุก chunk ไม่เกิน max_len
+    safe = []
+    for c in chunks:
+        if len(c) <= max_len:
+            safe.append(c)
+        else:
+            safe.append(c[:max_len])
+
+    return safe
 
 
 def reply_text(reply_token: str, text: str):
