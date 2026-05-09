@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,22 @@ ISSUER_URL   = f"{BASE_THAIBMA}/EN/Issuer/IssuerDetail.aspx"
 
 GRPC_BOND_SVC   = "bond-grpc/bond.BondGrpcService"
 GRPC_SEARCH_SVC = "bondsearch-grpc/BondSearchGrpc.Models.BondSearchGrpcService"
+
+
+# ─── Simple TTL cache ─────────────────────────────────────────────────────────
+import time as _time
+
+_BOND_CACHE = {}          # {symbol: (timestamp, detail_dict)}
+_CACHE_TTL  = 5 * 60      # 5 นาที
+
+def _cache_get(symbol):
+    entry = _BOND_CACHE.get(symbol)
+    if entry and (_time.time() - entry[0]) < _CACHE_TTL:
+        return entry[1]
+    return None
+
+def _cache_set(symbol, detail):
+    _BOND_CACHE[symbol] = (_time.time(), detail)
 
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
@@ -301,6 +318,7 @@ def get_bond_detail(symbol, issue_uuid, token, session):
     """
     ref = f"{BASE_IBOND}/bonds?symbol={symbol}"
     try:
+        pass  # no warm needed
         session.get(ref, headers={**HEADERS_BASE, "Accept": "text/html", "Referer": BASE_IBOND}, timeout=10)
     except Exception:
         pass
@@ -467,22 +485,39 @@ def search_bonds_by_company(company_name):
         issue_id = b.get("issue_id", "-")
         if not symbol or not token:
             return b
-        detail = get_bond_detail(symbol, issue_id, token, session)
+        # ตรวจ cache ก่อน
+        cached = _cache_get(symbol)
+        if cached:
+            logger.info(f"[cache] hit: {symbol}")
+            detail = cached
+        else:
+            detail = get_bond_detail(symbol, issue_id, token, session)
+            _cache_set(symbol, detail)
         for k, v in detail.items():
             if k not in b or b[k] == "-":
                 b[k] = v
         return b
 
-    # ดึงข้อมูล bond แบบ parallel (max 5 threads พร้อมกัน)
-    MAX_WORKERS = min(5, len(target_bonds))
-    if MAX_WORKERS > 0:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(fetch_one, b): b for b in target_bonds}
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.warning(f"[parallel] bond fetch error: {e}")
+    # เริ่ม SEC fetch พร้อมกับ bond fetch ทันที
+    MAX_WORKERS = min(10, len(target_bonds) + 1)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # submit SEC fetch ก่อน (background)
+        try:
+            from sec_scraper import search_sec_offerings
+            sec_future = executor.submit(search_sec_offerings, abbr)
+        except Exception:
+            sec_future = None
+
+        # submit bond fetches ทั้งหมดพร้อมกัน
+        bond_futures = {executor.submit(fetch_one, b): b for b in target_bonds}
+        for future in as_completed(bond_futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.warning(f"[parallel] bond fetch error: {e}")
+
+    # เก็บ sec_future ไว้ใช้ใน format_bond_message
+    bonds._sec_future = sec_future if sec_future else None
 
     logger.info(f"[main] Done: {len(bonds)} bonds")
     return bonds
@@ -524,16 +559,15 @@ def format_bond_message(bonds, company_name):
 
     add_bonds(long_bonds,  "📌 Long Term Debenture")
     add_bonds(short_bonds, "📌 Short Term Debenture")
-    # เพิ่มข้อมูล SEC offering ถ้ามี
+    # เพิ่มข้อมูล SEC offering — ใช้ future ที่ fetch ไว้แล้วตอน search_bonds
     try:
-        from sec_scraper import search_sec_offerings, format_sec_section
-        # SEC fetch ทำ parallel กับ bond format (เริ่ม thread ก่อนแล้วค่อย join)
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            sec_future = ex.submit(search_sec_offerings, company_name)
-            # ระหว่างนี้ format bond ไปก่อน
-            # (sec_future จะ resolve เมื่อต้องการ)
-        offerings = sec_future.result(timeout=30)
-        sec_text  = format_sec_section(offerings)
+        from sec_scraper import format_sec_section
+        sec_future = getattr(bonds, "_sec_future", None)
+        if sec_future:
+            offerings = sec_future.result(timeout=5)  # รอ max 5 วิ (น่าจะเสร็จแล้ว)
+        else:
+            offerings = []
+        sec_text = format_sec_section(offerings)
         if sec_text:
             lines.extend(["", sec_text])
     except Exception as _e:
