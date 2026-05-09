@@ -111,7 +111,7 @@ def extract_coupon_from_raw(frame):
     matches = re.findall(r'\b(\d{1,2}\.\d{1,4})\b', text)
     logger.info(f"[coupon_raw] all decimals: {matches[:15]}")
 
-    for m in matches:
+    for m in reversed(matches):
         decimal_part = m.split('.')[1]
         if len(decimal_part) > 2:
             # มีทศนิยมมากกว่า 2 ตำแหน่ง → ไม่ใช่ coupon rate ปกติ
